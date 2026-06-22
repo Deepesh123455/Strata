@@ -1,6 +1,9 @@
 package engine
 
-import "time"
+import (
+	"sync/atomic"
+	"time"
+)
 
 // ShardCount is fixed to 32.
 // Power of 2 sizes are great for memory alignment.
@@ -10,18 +13,54 @@ const ShardCount = 32
 type PowerhouseCache struct {
 	// A fixed-size array holding exactly 32 pointers to our Shards
 	shards [ShardCount]*Shard
+
+	// clock is the coarse, cache-wide LRU clock. It is advanced once per tick
+	// by the expiry worker; entries record its value on access. Coarse on
+	// purpose (cheap to read, no per-op contention) — Redis does the same.
+	clock atomic.Int64
 }
 
 // NewPowerhouseCache boots up the entire memory engine.
-func NewPowerhouseCache() *PowerhouseCache {
+//
+// maxMemoryBytes is the global memory budget; 0 means unlimited (no eviction).
+// The budget is split evenly across the 32 shards, each of which enforces its
+// own slice independently under its own lock — no global eviction lock needed.
+// With FNV hashing keys spread evenly, so per-shard budgeting closely tracks a
+// global cap while staying fully concurrent.
+func NewPowerhouseCache(maxMemoryBytes int64) *PowerhouseCache {
 	c := &PowerhouseCache{}
+
+	var perShard int64
+	if maxMemoryBytes > 0 {
+		perShard = maxMemoryBytes / ShardCount
+		if perShard < 1 {
+			perShard = 1
+		}
+	}
 
 	// Initialize all 32 independent shards
 	for i := 0; i < ShardCount; i++ {
-		c.shards[i] = NewShard()
+		c.shards[i] = newShardBudgeted(perShard, &c.clock)
 	}
 
 	return c
+}
+
+// MemoryUsage returns the approximate total live bytes across all shards.
+func (c *PowerhouseCache) MemoryUsage() int64 {
+	var total int64
+	for i := 0; i < ShardCount; i++ {
+		s := c.shards[i]
+		s.lock.RLock()
+		total += s.memBytes
+		s.lock.RUnlock()
+	}
+	return total
+}
+
+// tickClock advances the coarse LRU clock by one. Called by the expiry worker.
+func (c *PowerhouseCache) tickClock() {
+	c.clock.Add(1)
 }
 
 // getShard uses the hash to instantly find the correct bucket.

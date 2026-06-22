@@ -25,6 +25,8 @@ func (c *PowerhouseCache) StartExpiryWorker(quit chan struct{}) {
 				// Server is shutting down — stop the worker cleanly.
 				return
 			case <-ticker.C:
+				// Advance the coarse LRU clock so access-recency moves forward.
+				c.tickClock()
 				// Time to sweep. This is non-blocking; each shard holds its
 				// own write lock only for the duration of its own sweep.
 				c.runExpiryPass()

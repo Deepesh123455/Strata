@@ -16,7 +16,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.wal")
 
 	// --- First "process": write some data, then close the log durably. ---
-	c1 := engine.NewPowerhouseCache()
+	c1 := engine.NewPowerhouseCache(0)
 	if _, err := wal.Replay(path, func(_ uint64, p []byte) error { return applyRecord(c1, p) }); err != nil {
 		t.Fatalf("initial replay: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	}
 
 	// --- Second "process": fresh engine, replay the WAL. ---
-	c2 := engine.NewPowerhouseCache()
+	c2 := engine.NewPowerhouseCache(0)
 	lastSeq, err := LoadFromWAL(path, c2)
 	if err != nil {
 		t.Fatalf("recovery: %v", err)
@@ -68,7 +68,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 func TestTornTailTruncated(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "torn.wal")
 
-	c1 := engine.NewPowerhouseCache()
+	c1 := engine.NewPowerhouseCache(0)
 	log1, _ := wal.Open(path, 0, wal.SyncAlways)
 	a1 := New(c1, log1)
 	if err := a1.Set([]byte("k"), []byte("v"), 0); err != nil {
@@ -81,7 +81,7 @@ func TestTornTailTruncated(t *testing.T) {
 	f.Write([]byte{0xA7, 0x00, 0x01, 0x02}) // truncated header garbage
 	f.Close()
 
-	c2 := engine.NewPowerhouseCache()
+	c2 := engine.NewPowerhouseCache(0)
 	if _, err := LoadFromWAL(path, c2); err != nil {
 		t.Fatalf("recovery with torn tail: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestTornTailTruncated(t *testing.T) {
 	if info.Size() != 17+1+1+2+2 /* hdr + $1\r\nk\r\n style record */ {
 		// exact size depends on encoding; just assert the garbage 4 bytes are gone
 		// by reloading again cleanly (no error == clean prefix).
-		if _, err := LoadFromWAL(path, engine.NewPowerhouseCache()); err != nil {
+		if _, err := LoadFromWAL(path, engine.NewPowerhouseCache(0)); err != nil {
 			t.Fatalf("second recovery failed, tail not truncated: %v", err)
 		}
 	}

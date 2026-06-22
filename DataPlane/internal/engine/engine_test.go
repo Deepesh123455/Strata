@@ -147,7 +147,7 @@ func TestShard_EvictExpired(t *testing.T) {
 // --- Cache-level integration tests ---
 
 func TestCache_SetGetWithTTL(t *testing.T) {
-	c := NewPowerhouseCache()
+	c := NewPowerhouseCache(0)
 	c.Set([]byte("user:1"), []byte("Deepesh"), 100*time.Millisecond)
 
 	// Immediate get should succeed.
@@ -165,7 +165,7 @@ func TestCache_SetGetWithTTL(t *testing.T) {
 }
 
 func TestCache_TTL(t *testing.T) {
-	c := NewPowerhouseCache()
+	c := NewPowerhouseCache(0)
 	c.Set([]byte("session"), []byte("abc"), 10*time.Second)
 
 	ttl := c.TTL([]byte("session"))
@@ -175,7 +175,7 @@ func TestCache_TTL(t *testing.T) {
 }
 
 func TestCache_Persist(t *testing.T) {
-	c := NewPowerhouseCache()
+	c := NewPowerhouseCache(0)
 	c.Set([]byte("token"), []byte("xyz"), 10*time.Second)
 	if !c.Persist([]byte("token")) {
 		t.Fatal("Persist should succeed")
@@ -186,7 +186,7 @@ func TestCache_Persist(t *testing.T) {
 }
 
 func TestCache_ExpiryWorker_CleansUpKeys(t *testing.T) {
-	c := NewPowerhouseCache()
+	c := NewPowerhouseCache(0)
 	quit := make(chan struct{})
 	c.StartExpiryWorker(quit)
 	defer close(quit)

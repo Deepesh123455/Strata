@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/applier"
@@ -20,14 +21,38 @@ const Port = ":6379"
 // this file to rebuild the keyspace.
 const walPath = "./data/powerhouse.wal"
 
+// maxMemoryEnv is the env var that sets the global memory cap, in megabytes.
+// 0 / unset means unlimited. On the 1GB AWS Free Tier box, set this (e.g. 700)
+// to keep the process from being OOM-killed.
+const maxMemoryEnv = "POWERHOUSE_MAXMEMORY_MB"
+
+// resolveMaxMemory reads the memory cap from the environment, in bytes.
+func resolveMaxMemory() int64 {
+	v := os.Getenv(maxMemoryEnv)
+	if v == "" {
+		return 0
+	}
+	mb, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || mb <= 0 {
+		fmt.Printf("[WARN] ignoring invalid %s=%q\n", maxMemoryEnv, v)
+		return 0
+	}
+	return mb * 1024 * 1024
+}
+
 func main() {
 	fmt.Println("========================================")
 	fmt.Println("    POWERHOUSE CACHE - BOOT SEQUENCE    ")
 	fmt.Println("========================================")
 
 	// 1. Boot up the 32-Shard Memory Engine
-	fmt.Println("[SYSTEM] Allocating 32-shard concurrent memory map...")
-	cacheEngine := engine.NewPowerhouseCache()
+	maxMem := resolveMaxMemory()
+	if maxMem > 0 {
+		fmt.Printf("[SYSTEM] Allocating 32-shard memory map (maxmemory: %d MB, LRU eviction)...\n", maxMem/(1024*1024))
+	} else {
+		fmt.Println("[SYSTEM] Allocating 32-shard memory map (maxmemory: unlimited)...")
+	}
+	cacheEngine := engine.NewPowerhouseCache(maxMem)
 
 	// 2. RECOVERY: replay the WAL into the engine BEFORE accepting any traffic.
 	// This rebuilds everything that was durable at the last shutdown/crash and
