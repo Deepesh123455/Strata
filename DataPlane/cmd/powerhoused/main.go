@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -26,8 +27,14 @@ const walPath = "./data/powerhouse.wal"
 // to keep the process from being OOM-killed.
 const maxMemoryEnv = "POWERHOUSE_MAXMEMORY_MB"
 
-// resolveMaxMemory reads the memory cap from the environment, in bytes.
-func resolveMaxMemory() int64 {
+// resolveMaxMemory reads the memory cap in bytes, preferring the CLI flag
+// (in MB) over the environment variable. A non-positive flag value falls back
+// to POWERHOUSE_MAXMEMORY_MB; if that is unset/invalid, the cache is unlimited.
+func resolveMaxMemory(flagMB int64) int64 {
+	if flagMB > 0 {
+		return flagMB * 1024 * 1024
+	}
+
 	v := os.Getenv(maxMemoryEnv)
 	if v == "" {
 		return 0
@@ -41,12 +48,18 @@ func resolveMaxMemory() int64 {
 }
 
 func main() {
+	// -maxmemory sets the global memory cap in MEGABYTES. A positive value wins
+	// over POWERHOUSE_MAXMEMORY_MB; 0 (default) means unlimited unless the env
+	// var is set. flag.Parse must run before we read the value.
+	maxMemMB := flag.Int64("maxmemory", 0, "global memory cap in MB (0 = unlimited)")
+	flag.Parse()
+
 	fmt.Println("========================================")
 	fmt.Println("    POWERHOUSE CACHE - BOOT SEQUENCE    ")
 	fmt.Println("========================================")
 
 	// 1. Boot up the 32-Shard Memory Engine
-	maxMem := resolveMaxMemory()
+	maxMem := resolveMaxMemory(*maxMemMB)
 	if maxMem > 0 {
 		fmt.Printf("[SYSTEM] Allocating 32-shard memory map (maxmemory: %d MB, LRU eviction)...\n", maxMem/(1024*1024))
 	} else {

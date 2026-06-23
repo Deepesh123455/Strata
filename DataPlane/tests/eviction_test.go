@@ -1,8 +1,10 @@
-package engine
+package tests
 
 import (
 	"fmt"
 	"testing"
+
+	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/engine"
 )
 
 // TestMaxMemory_EnforcesCap proves the cache stays under its memory budget by
@@ -10,7 +12,7 @@ import (
 func TestMaxMemory_EnforcesCap(t *testing.T) {
 	// Small global cap so the test is fast. Split across 32 shards internally.
 	const cap = 256 * 1024 // 256 KB
-	c := NewPowerhouseCache(cap)
+	c := engine.NewPowerhouseCache(cap)
 
 	// Write far more data than the cap allows.
 	val := make([]byte, 512) // 512-byte values
@@ -30,7 +32,7 @@ func TestMaxMemory_EnforcesCap(t *testing.T) {
 
 // TestMaxMemory_Unlimited confirms a 0 cap means no eviction.
 func TestMaxMemory_Unlimited(t *testing.T) {
-	c := NewPowerhouseCache(0)
+	c := engine.NewPowerhouseCache(0)
 	for i := 0; i < 1000; i++ {
 		c.Set([]byte(fmt.Sprintf("k:%d", i)), []byte("v"), 0)
 	}
@@ -46,7 +48,7 @@ func TestMaxMemory_Unlimited(t *testing.T) {
 // repeated access should outlive cold keys when the cap forces eviction.
 func TestMaxMemory_EvictsColdBeforeHot(t *testing.T) {
 	const cap = 64 * 1024
-	c := NewPowerhouseCache(cap)
+	c := engine.NewPowerhouseCache(cap)
 
 	// Advance the LRU clock manually (no expiry worker running in this test).
 	hot := []byte("hot-key")
@@ -54,7 +56,7 @@ func TestMaxMemory_EvictsColdBeforeHot(t *testing.T) {
 	c.Set(hot, val, 0)
 
 	for i := 0; i < 2000; i++ {
-		c.tickClock()                                  // time moves forward
+		c.TickClock()                                  // time moves forward
 		c.Set([]byte(fmt.Sprintf("cold:%d", i)), val, 0)
 		c.Get(hot)                                     // keep the hot key warm
 	}

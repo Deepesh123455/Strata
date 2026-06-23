@@ -82,14 +82,26 @@ func (s *Server) Start() error {
 			}
 		}
 
-		// 3. A client connected! 
+		// 3. A client connected!
 		// Increment our WaitGroup so the server knows we have +1 active client.
+		// Doing this here (synchronously, before the goroutine) is deliberate:
+		// it guarantees every Add happens-before the accept loop returns, so
+		// Stop()'s wg.Wait() can never race an Add against a zero counter.
 		s.wg.Add(1)
 
 		// 4. Hand the connection off to a dedicated Goroutine (Worker).
 		// By putting 'go' in front, this function instantly detaches and runs in the background.
 		go s.handleConnection(conn)
 	}
+}
+
+// ServeConn handles a single client connection to completion on the calling
+// goroutine, accounting for it in the graceful-shutdown WaitGroup. The accept
+// loop inlines this same Add(1)+handle pairing; tests and alternative
+// transports can call ServeConn directly with any net.Conn (e.g. a net.Pipe).
+func (s *Server) ServeConn(conn net.Conn) {
+	s.wg.Add(1)
+	s.handleConnection(conn) // its deferred wg.Done() balances the Add above
 }
 
 // Stop initiates a graceful shutdown of the edge.

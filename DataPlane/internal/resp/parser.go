@@ -6,9 +6,22 @@ import (
 	"fmt"
 )
 
-// ErrIncomplete tells our TCP worker: "The network packet got split in half, 
+// ErrIncomplete tells our TCP worker: "The network packet got split in half,
 // go back to sleep and wait for the rest of the bytes."
 var ErrIncomplete = errors.New("incomplete command, waiting for more bytes")
+
+// Sanity caps on declared lengths. parseLen only guards against word-size
+// overflow, so without these a hostile client could declare a near-MaxInt
+// bulk length. The subsequent `cursor+strLen+2` arithmetic would then overflow
+// to a negative value, slip past the bounds check, and panic the parser with an
+// out-of-range index — crashing the whole server. Bounding the declared length
+// to a plausible maximum keeps that arithmetic safe and rejects garbage early.
+const (
+	// maxBulkLen mirrors the 512MB Redis value ceiling (and the server/WAL caps).
+	maxBulkLen = 512 << 20
+	// maxArrayLen bounds the element count of a single command, like Redis.
+	maxArrayLen = 1 << 20
+)
 
 // parseLen converts a byte slice (e.g., "123" or "-1") into an integer.
 // It returns an error if the field is empty, contains non-digits, or overflows.
@@ -77,6 +90,9 @@ func Parse(buffer []byte) ([][]byte, int, error) {
 		}
 		return nil, 0, fmt.Errorf("protocol error: invalid negative argument count %d", argCount)
 	}
+	if argCount > maxArrayLen {
+		return nil, 0, fmt.Errorf("protocol error: argument count %d exceeds limit", argCount)
+	}
 
 	// 3. Loop through and extract each argument using Slices
 	for i := 0; i < argCount; i++ {
@@ -108,6 +124,11 @@ func Parse(buffer []byte) ([][]byte, int, error) {
 				continue
 			}
 			return nil, 0, fmt.Errorf("protocol error: invalid negative bulk string length %d", strLen)
+		}
+		// Reject implausibly large lengths BEFORE the arithmetic below, so
+		// cursor+strLen+2 cannot overflow into a negative index.
+		if strLen > maxBulkLen {
+			return nil, 0, fmt.Errorf("protocol error: bulk string length %d exceeds limit", strLen)
 		}
 
 		// Security Check: Do we actually have enough bytes left in the buffer?

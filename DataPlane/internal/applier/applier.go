@@ -116,14 +116,14 @@ func (a *Applier) Persist(key []byte) (bool, error) {
 // before opening the live wal.Log for appends.
 func LoadFromWAL(path string, cache *engine.PowerhouseCache) (uint64, error) {
 	return wal.Replay(path, func(_ uint64, payload []byte) error {
-		return applyRecord(cache, payload)
+		return ApplyRecord(cache, payload)
 	})
 }
 
-// applyRecord decodes one canonical WAL payload and applies it directly to the
+// ApplyRecord decodes one canonical WAL payload and applies it directly to the
 // engine. Records carry absolute deadlines (PXAT/PEXPIREAT), so any key whose
 // deadline has already passed is dropped instead of being resurrected.
-func applyRecord(cache *engine.PowerhouseCache, payload []byte) error {
+func ApplyRecord(cache *engine.PowerhouseCache, payload []byte) error {
 	args, _, err := resp.Parse(payload)
 	if err != nil {
 		return err

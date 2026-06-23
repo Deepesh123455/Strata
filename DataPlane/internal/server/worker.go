@@ -1,7 +1,7 @@
 package server
 
 import (
-	"bytes"
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +19,44 @@ import (
 // large values (Redis permits values up to 512MB).
 const maxCommandSize = 512 << 20
 
+// writeBufSize is the per-connection response buffer. Responses for a whole
+// pipelined batch accumulate here and are flushed in ONE syscall after the
+// batch is drained, instead of one (or, for GET, three) syscalls per command.
+const writeBufSize = 16 << 10 // 16KB
+
+// Hot-path response literals, allocated once at startup instead of on every
+// command. They are written but never mutated, so sharing them across all
+// connection goroutines is safe.
+var (
+	respOK       = []byte("+OK\r\n")
+	respNullBulk = []byte("$-1\r\n")
+	respOne      = []byte(":1\r\n")
+	respZero     = []byte(":0\r\n")
+	respCRLF     = []byte("\r\n")
+)
+
+// upperInPlace upper-cases an ASCII byte slice in place (no allocation). The
+// command/option slices alias the connection's read buffer and are fully
+// consumed before the buffer is reused, so mutating them here is safe.
+func upperInPlace(b []byte) {
+	for i, c := range b {
+		if c >= 'a' && c <= 'z' {
+			b[i] = c - ('a' - 'A')
+		}
+	}
+}
+
+// writeInt writes a RESP integer reply (":<n>\r\n") without allocating: the
+// digits are formatted into a stack buffer that never escapes.
+func writeInt(w *bufio.Writer, n int64) error {
+	var b [24]byte
+	buf := append(b[:0], ':')
+	buf = strconv.AppendInt(buf, n, 10)
+	buf = append(buf, '\r', '\n')
+	_, err := w.Write(buf)
+	return err
+}
+
 // handleConnection is the dedicated worker for a single client.
 // It runs entirely in its own Goroutine, managed by the Netpoller.
 func (s *Server) handleConnection(conn net.Conn) {
@@ -30,12 +68,27 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer s.deregisterConn(conn) // Deregister from active connection tracking
 	defer conn.Close()        // Politely ask the OS to destroy the TCP socket
 
+	// Isolate this client: a panic while parsing or executing one connection's
+	// data must never take down the whole server (every other client's data
+	// included). Recover here, log it, and let the deferred cleanup drop just
+	// this connection.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[PANIC] recovered on connection %s: %v\n", conn.RemoteAddr(), r)
+		}
+	}()
+
 	// 2. Zero-Allocation Memory Lease
 	bufferPtr := pool.Get()
 	defer pool.Put(bufferPtr)
 
 	buffer := *bufferPtr
 	clientAddr := conn.RemoteAddr().String()
+
+	// Buffered writer: responses are written here and flushed once per read
+	// batch (see end of the loop), collapsing a pipeline of N commands from
+	// up to 3N socket syscalls down to ~1.
+	w := bufio.NewWriterSize(conn, writeBufSize)
 
 	unread := 0
 
@@ -101,13 +154,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 				return
 			}
 
-			// Execute the parsed command
-			if err := s.executeCommand(conn, cmdSlices); err != nil {
+			// Execute the parsed command (buffered; not yet on the wire)
+			if err := s.executeCommand(w, cmdSlices); err != nil {
 				// Client disconnected or connection error
 				return
 			}
 
 			cursor += consumed
+		}
+
+		// Flush all buffered responses for this batch in one syscall before we
+		// block on the next Read. A flush error means the client is gone.
+		if err := w.Flush(); err != nil {
+			return
 		}
 
 		// 8. Shift remaining unparsed bytes to the beginning of the buffer
@@ -125,25 +184,29 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 // executeCommand dispatches a parsed RESP command to the correct handler.
-func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
+// Responses are written to the buffered writer w; the caller flushes once per
+// batch, so a single command never triggers its own socket syscall.
+func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	if len(cmdSlices) == 0 || cmdSlices[0] == nil {
 		return nil
 	}
 
-	commandName := string(bytes.ToUpper(cmdSlices[0]))
+	// Upper-case the command verb in place and switch on it. `switch string(b)`
+	// over a []byte is a compiler-optimized comparison that does not allocate.
+	upperInPlace(cmdSlices[0])
 
-	switch commandName {
+	switch string(cmdSlices[0]) {
 
 	// -----------------------------------------------------------------------
 	// SET key value [EX seconds] [PX milliseconds]
 	// -----------------------------------------------------------------------
 	case "SET":
 		if len(cmdSlices) < 3 {
-			_, err := conn.Write([]byte("-ERR wrong number of arguments for 'set' command\r\n"))
+			_, err := w.Write([]byte("-ERR wrong number of arguments for 'set' command\r\n"))
 			return err
 		}
 		if cmdSlices[1] == nil {
-			_, err := conn.Write([]byte("-ERR key cannot be null\r\n"))
+			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
 			return err
 		}
 
@@ -157,35 +220,35 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 				i++
 				continue
 			}
-			option := string(bytes.ToUpper(cmdSlices[i]))
-			switch option {
+			upperInPlace(cmdSlices[i])
+			switch string(cmdSlices[i]) {
 			case "EX", "PX":
 				if i+1 >= len(cmdSlices) || cmdSlices[i+1] == nil {
-					_, err := conn.Write([]byte("-ERR syntax error\r\n"))
+					_, err := w.Write([]byte("-ERR syntax error\r\n"))
 					return err
 				}
 				val, parseErr := strconv.ParseInt(string(cmdSlices[i+1]), 10, 64)
 				if parseErr != nil || val <= 0 {
-					_, err := conn.Write([]byte("-ERR invalid expire time in 'set' command\r\n"))
+					_, err := w.Write([]byte("-ERR invalid expire time in 'set' command\r\n"))
 					return err
 				}
-				if option == "EX" {
+				if string(cmdSlices[i]) == "EX" {
 					ttl = time.Duration(val) * time.Second
 				} else {
 					ttl = time.Duration(val) * time.Millisecond
 				}
 				i += 2
 			default:
-				_, err := conn.Write([]byte("-ERR syntax error\r\n"))
+				_, err := w.Write([]byte("-ERR syntax error\r\n"))
 				return err
 			}
 		}
 
 		if err := s.app.Set(cmdSlices[1], cmdSlices[2], ttl); err != nil {
-			_, werr := conn.Write([]byte("-ERR persistence error\r\n"))
+			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
 			return werr
 		}
-		_, err := conn.Write([]byte("+OK\r\n"))
+		_, err := w.Write(respOK)
 		return err
 
 	// -----------------------------------------------------------------------
@@ -194,18 +257,18 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "DEL":
 		if len(cmdSlices) < 2 {
-			_, err := conn.Write([]byte("-ERR wrong number of arguments for 'del' command\r\n"))
+			_, err := w.Write([]byte("-ERR wrong number of arguments for 'del' command\r\n"))
 			return err
 		}
 		if cmdSlices[1] == nil {
-			_, err := conn.Write([]byte("-ERR key cannot be null\r\n"))
+			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
 			return err
 		}
 		if err := s.app.Delete(cmdSlices[1]); err != nil {
-			_, werr := conn.Write([]byte("-ERR persistence error\r\n"))
+			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
 			return werr
 		}
-		_, err := conn.Write([]byte(":1\r\n"))
+		_, err := w.Write(respOne)
 		return err
 
 	// -----------------------------------------------------------------------
@@ -213,31 +276,35 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "GET":
 		if len(cmdSlices) < 2 {
-			_, err := conn.Write([]byte("-ERR wrong number of arguments for 'get' command\r\n"))
+			_, err := w.Write([]byte("-ERR wrong number of arguments for 'get' command\r\n"))
 			return err
 		}
 		if cmdSlices[1] == nil {
-			_, err := conn.Write([]byte("-ERR key cannot be null\r\n"))
+			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
 			return err
 		}
 		val, exists := s.app.Get(cmdSlices[1])
 		if !exists {
-			_, err := conn.Write([]byte("$-1\r\n"))
+			_, err := w.Write(respNullBulk)
 			return err
 		}
 		if val == nil {
-			_, err := conn.Write([]byte("$-1\r\n"))
+			_, err := w.Write(respNullBulk)
 			return err
 		}
-		// RESP Bulk String: $<len>\r\n<data>\r\n
-		header := fmt.Sprintf("$%d\r\n", len(val))
-		if _, err := conn.Write([]byte(header)); err != nil {
+		// RESP Bulk String: $<len>\r\n<data>\r\n. Build the header without
+		// allocating: a stack buffer holds "$<len>\r\n".
+		var hdr [24]byte
+		h := append(hdr[:0], '$')
+		h = strconv.AppendInt(h, int64(len(val)), 10)
+		h = append(h, '\r', '\n')
+		if _, err := w.Write(h); err != nil {
 			return err
 		}
-		if _, err := conn.Write(val); err != nil {
+		if _, err := w.Write(val); err != nil {
 			return err
 		}
-		_, err := conn.Write([]byte("\r\n"))
+		_, err := w.Write(respCRLF)
 		return err
 
 	// -----------------------------------------------------------------------
@@ -247,28 +314,28 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "EXPIRE":
 		if len(cmdSlices) < 3 {
-			_, err := conn.Write([]byte("-ERR wrong number of arguments for 'expire' command\r\n"))
+			_, err := w.Write([]byte("-ERR wrong number of arguments for 'expire' command\r\n"))
 			return err
 		}
 		if cmdSlices[1] == nil || cmdSlices[2] == nil {
-			_, err := conn.Write([]byte("-ERR invalid arguments\r\n"))
+			_, err := w.Write([]byte("-ERR invalid arguments\r\n"))
 			return err
 		}
 		secs, parseErr := strconv.ParseInt(string(cmdSlices[2]), 10, 64)
 		if parseErr != nil || secs <= 0 {
-			_, err := conn.Write([]byte("-ERR invalid expire time in 'expire' command\r\n"))
+			_, err := w.Write([]byte("-ERR invalid expire time in 'expire' command\r\n"))
 			return err
 		}
 		ok, aerr := s.app.Expire(cmdSlices[1], time.Duration(secs)*time.Second)
 		if aerr != nil {
-			_, werr := conn.Write([]byte("-ERR persistence error\r\n"))
+			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
 			return werr
 		}
 		if ok {
-			_, err := conn.Write([]byte(":1\r\n"))
+			_, err := w.Write(respOne)
 			return err
 		}
-		_, err := conn.Write([]byte(":0\r\n"))
+		_, err := w.Write(respZero)
 		return err
 
 	// -----------------------------------------------------------------------
@@ -277,28 +344,28 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "PEXPIRE":
 		if len(cmdSlices) < 3 {
-			_, err := conn.Write([]byte("-ERR wrong number of arguments for 'pexpire' command\r\n"))
+			_, err := w.Write([]byte("-ERR wrong number of arguments for 'pexpire' command\r\n"))
 			return err
 		}
 		if cmdSlices[1] == nil || cmdSlices[2] == nil {
-			_, err := conn.Write([]byte("-ERR invalid arguments\r\n"))
+			_, err := w.Write([]byte("-ERR invalid arguments\r\n"))
 			return err
 		}
 		ms, parseErr := strconv.ParseInt(string(cmdSlices[2]), 10, 64)
 		if parseErr != nil || ms <= 0 {
-			_, err := conn.Write([]byte("-ERR invalid expire time in 'pexpire' command\r\n"))
+			_, err := w.Write([]byte("-ERR invalid expire time in 'pexpire' command\r\n"))
 			return err
 		}
 		ok, aerr := s.app.Expire(cmdSlices[1], time.Duration(ms)*time.Millisecond)
 		if aerr != nil {
-			_, werr := conn.Write([]byte("-ERR persistence error\r\n"))
+			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
 			return werr
 		}
 		if ok {
-			_, err := conn.Write([]byte(":1\r\n"))
+			_, err := w.Write(respOne)
 			return err
 		}
-		_, err := conn.Write([]byte(":0\r\n"))
+		_, err := w.Write(respZero)
 		return err
 
 	// -----------------------------------------------------------------------
@@ -308,11 +375,11 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "TTL":
 		if len(cmdSlices) < 2 {
-			_, err := conn.Write([]byte("-ERR wrong number of arguments for 'ttl' command\r\n"))
+			_, err := w.Write([]byte("-ERR wrong number of arguments for 'ttl' command\r\n"))
 			return err
 		}
 		if cmdSlices[1] == nil {
-			_, err := conn.Write([]byte("-ERR key cannot be null\r\n"))
+			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
 			return err
 		}
 		remaining := s.app.TTL(cmdSlices[1])
@@ -329,8 +396,7 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 				secs = 1
 			}
 		}
-		_, err := conn.Write([]byte(fmt.Sprintf(":%d\r\n", secs)))
-		return err
+		return writeInt(w, secs)
 
 	// -----------------------------------------------------------------------
 	// PTTL key
@@ -339,11 +405,11 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "PTTL":
 		if len(cmdSlices) < 2 {
-			_, err := conn.Write([]byte("-ERR wrong number of arguments for 'pttl' command\r\n"))
+			_, err := w.Write([]byte("-ERR wrong number of arguments for 'pttl' command\r\n"))
 			return err
 		}
 		if cmdSlices[1] == nil {
-			_, err := conn.Write([]byte("-ERR key cannot be null\r\n"))
+			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
 			return err
 		}
 		remaining := s.app.TTL(cmdSlices[1])
@@ -359,8 +425,7 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 				ms = 1
 			}
 		}
-		_, err := conn.Write([]byte(fmt.Sprintf(":%d\r\n", ms)))
-		return err
+		return writeInt(w, ms)
 
 	// -----------------------------------------------------------------------
 	// PERSIST key
@@ -369,30 +434,31 @@ func (s *Server) executeCommand(conn net.Conn, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "PERSIST":
 		if len(cmdSlices) < 2 {
-			_, err := conn.Write([]byte("-ERR wrong number of arguments for 'persist' command\r\n"))
+			_, err := w.Write([]byte("-ERR wrong number of arguments for 'persist' command\r\n"))
 			return err
 		}
 		if cmdSlices[1] == nil {
-			_, err := conn.Write([]byte("-ERR key cannot be null\r\n"))
+			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
 			return err
 		}
 		ok, aerr := s.app.Persist(cmdSlices[1])
 		if aerr != nil {
-			_, werr := conn.Write([]byte("-ERR persistence error\r\n"))
+			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
 			return werr
 		}
 		if ok {
-			_, err := conn.Write([]byte(":1\r\n"))
+			_, err := w.Write(respOne)
 			return err
 		}
-		_, err := conn.Write([]byte(":0\r\n"))
+		_, err := w.Write(respZero)
 		return err
 
 	// -----------------------------------------------------------------------
 	// Unknown command
 	// -----------------------------------------------------------------------
 	default:
-		_, err := conn.Write([]byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", commandName)))
+		// Off the hot path; cmdSlices[0] holds the (now upper-cased) verb.
+		_, err := fmt.Fprintf(w, "-ERR unknown command '%s'\r\n", cmdSlices[0])
 		return err
 	}
 }

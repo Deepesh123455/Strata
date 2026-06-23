@@ -1,9 +1,11 @@
-package resp
+package tests
 
 import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/resp"
 )
 
 func TestParse(t *testing.T) {
@@ -33,14 +35,14 @@ func TestParse(t *testing.T) {
 			input:        []byte("*3\r\n$3\r\nSET\r\n"),
 			wantArgs:     nil,
 			wantConsumed: 0,
-			wantErr:      ErrIncomplete,
+			wantErr:      resp.ErrIncomplete,
 		},
 		{
 			name:         "Incomplete bulk string payload",
 			input:        []byte("*3\r\n$3\r\nSET\r\n$4\r\nkey"),
 			wantArgs:     nil,
 			wantConsumed: 0,
-			wantErr:      ErrIncomplete,
+			wantErr:      resp.ErrIncomplete,
 		},
 		{
 			name:         "Empty input",
@@ -75,7 +77,7 @@ func TestParse(t *testing.T) {
 			input:        []byte("*2\r\n$3\r\nGET\r\n$4\r\nkeys"),
 			wantArgs:     nil,
 			wantConsumed: 0,
-			wantErr:      ErrIncomplete,
+			wantErr:      resp.ErrIncomplete,
 		},
 		{
 			name:         "Incorrect CRLF trailing characters",
@@ -88,14 +90,14 @@ func TestParse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			args, consumed, err := Parse(tt.input)
+			args, consumed, err := resp.Parse(tt.input)
 
 			if tt.wantErr != nil {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
 				}
-				if tt.wantErr == ErrIncomplete {
-					if !errors.Is(err, ErrIncomplete) {
+				if tt.wantErr == resp.ErrIncomplete {
+					if !errors.Is(err, resp.ErrIncomplete) {
 						t.Errorf("expected ErrIncomplete, got %v", err)
 					}
 				}

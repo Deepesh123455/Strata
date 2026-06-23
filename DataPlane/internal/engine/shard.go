@@ -171,6 +171,16 @@ func (s *Shard) Get(key string) ([]byte, bool) {
 	return val, true
 }
 
+// Has reports whether the key is physically present in the shard's map,
+// WITHOUT triggering lazy expiry. It is an introspection helper for tests that
+// need to verify the active-expiry worker actually removed an entry.
+func (s *Shard) Has(key string) bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	_, ok := s.items[key]
+	return ok
+}
+
 // Delete safely removes a key from this specific shard.
 func (s *Shard) Delete(key string) {
 	s.lock.Lock()
