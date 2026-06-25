@@ -98,9 +98,10 @@ func (c *PowerhouseCache) Get(key []byte) ([]byte, bool) {
 }
 
 // Delete routes the key and safely removes it.
-func (c *PowerhouseCache) Delete(key []byte) {
+// Returns true if the key existed and was removed.
+func (c *PowerhouseCache) Delete(key []byte) bool {
 	shard := c.GetShard(key)
-	shard.Delete(string(key))
+	return shard.Delete(string(key))
 }
 
 // TTL returns the remaining time-to-live for a key.

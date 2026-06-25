@@ -75,14 +75,16 @@ func (a *Applier) Set(key, value []byte, ttl time.Duration) error {
 	return err
 }
 
-// Delete removes a key.
-func (a *Applier) Delete(key []byte) error {
-	a.cache.Delete(key)
-	if a.log == nil {
-		return nil
+// Delete removes a key. Returns whether the key actually existed. Only an
+// effective delete is logged — a DEL on a missing key is a no-op that would
+// replay as a no-op anyway, so it stays out of the WAL.
+func (a *Applier) Delete(key []byte) (bool, error) {
+	existed := a.cache.Delete(key)
+	if !existed || a.log == nil {
+		return existed, nil
 	}
 	_, err := a.log.Append(encodeCommand([]byte("DEL"), key))
-	return err
+	return existed, err
 }
 
 // Expire applies a relative TTL to an existing key. Returns whether the key

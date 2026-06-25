@@ -58,19 +58,22 @@ func TestServer_PipelinedBatchFlush(t *testing.T) {
 	defer cleanup()
 	client.SetDeadline(time.Now().Add(3 * time.Second))
 
-	// SET foo bar ; GET foo ; TTL foo ; DEL foo ; GET foo  — all in one write.
+	// SET foo bar ; GET foo ; TTL foo ; DEL foo ; GET foo ; DEL foo (again) — one write.
+	// The second DEL targets a now-missing key and must report :0, not :1.
 	batch := "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n" +
 		"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n" +
 		"*2\r\n$3\r\nTTL\r\n$3\r\nfoo\r\n" +
 		"*2\r\n$3\r\nDEL\r\n$3\r\nfoo\r\n" +
-		"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"
+		"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n" +
+		"*2\r\n$3\r\nDEL\r\n$3\r\nfoo\r\n"
 	if _, err := client.Write([]byte(batch)); err != nil {
 		t.Fatalf("write batch: %v", err)
 	}
 
 	r := bufio.NewReader(client)
-	// +OK (set), $3 bar (get), :-1 (ttl, no expiry), :1 (del), $-1 (get missing)
-	readExactly(t, r, "+OK\r\n$3\r\nbar\r\n:-1\r\n:1\r\n$-1\r\n")
+	// +OK (set), $3 bar (get), :-1 (ttl, no expiry), :1 (del hit),
+	// $-1 (get missing), :0 (del miss)
+	readExactly(t, r, "+OK\r\n$3\r\nbar\r\n:-1\r\n:1\r\n$-1\r\n:0\r\n")
 }
 
 // TestServer_SetWithExpiryAndPersist checks the SET EX / TTL / PERSIST path

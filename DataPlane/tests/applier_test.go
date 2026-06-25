@@ -33,8 +33,16 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	if err := a1.Set([]byte("temp"), []byte("gone"), 0); err != nil {
 		t.Fatalf("set temp: %v", err)
 	}
-	if err := a1.Delete([]byte("temp")); err != nil {
+	if existed, err := a1.Delete([]byte("temp")); err != nil {
 		t.Fatalf("del: %v", err)
+	} else if !existed {
+		t.Fatal("del temp: expected existed=true")
+	}
+	// Deleting a key that was never set must report existed=false.
+	if existed, err := a1.Delete([]byte("never-set")); err != nil {
+		t.Fatalf("del missing: %v", err)
+	} else if existed {
+		t.Fatal("del never-set: expected existed=false")
 	}
 	if _, err := a1.Expire([]byte("name"), time.Hour); err != nil {
 		t.Fatalf("expire: %v", err)

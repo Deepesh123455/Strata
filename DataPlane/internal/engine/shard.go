@@ -182,13 +182,16 @@ func (s *Shard) Has(key string) bool {
 }
 
 // Delete safely removes a key from this specific shard.
-func (s *Shard) Delete(key string) {
+// Returns true if the key existed and was removed, false if it was absent.
+func (s *Shard) Delete(key string) bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	if e, ok := s.items[key]; ok {
 		s.memBytes -= entrySize(key, e)
 		delete(s.items, key)
+		return true
 	}
+	return false
 }
 
 // TTL returns the remaining time-to-live for a key.

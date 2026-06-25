@@ -110,5 +110,13 @@ temp/
 # ─── Redis / Data files ───────────────────────────────────────────────────────
 *.rdb
 *.aof
+*.wal
 dump.rdb
 appendonly.aof
+
+# Runtime data directory (WAL lives here at runtime; never commit it)
+/data/
+
+# ─── Generated docs ───────────────────────────────────────────────────────────
+# Keep the Markdown sources in git; the rendered PDFs are build artifacts.
+docs/*.pdf

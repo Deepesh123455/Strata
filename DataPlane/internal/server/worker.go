@@ -253,7 +253,8 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 
 	// -----------------------------------------------------------------------
 	// DEL key
-	// Removes a key. Returns :1 if the key handler ran (single-key form).
+	// Removes a key. Returns the number of keys actually removed: :1 if the
+	// key existed, :0 if it did not (matches Redis single-key semantics).
 	// -----------------------------------------------------------------------
 	case "DEL":
 		if len(cmdSlices) < 2 {
@@ -264,11 +265,16 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
 			return err
 		}
-		if err := s.app.Delete(cmdSlices[1]); err != nil {
+		existed, aerr := s.app.Delete(cmdSlices[1])
+		if aerr != nil {
 			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
 			return werr
 		}
-		_, err := w.Write(respOne)
+		if existed {
+			_, err := w.Write(respOne)
+			return err
+		}
+		_, err := w.Write(respZero)
 		return err
 
 	// -----------------------------------------------------------------------
