@@ -1,0 +1,34 @@
+# Normalize line endings so the Windows dev box and the Linux CI/Docker builds
+# see byte-identical files. Without this, a CRLF shell script or Makefile breaks
+# bash on the Ubuntu runners (`\r` command not found), and gofmt/diff churns.
+
+# Default: treat as text, check out with the platform's native EOL, but always
+# STORE as LF in git.
+* text=auto eol=lf
+
+# Source & config — force LF everywhere (these run on Linux in CI/containers).
+*.go        text eol=lf
+*.mod       text eol=lf
+*.sum       text eol=lf
+*.work      text eol=lf
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.tf        text eol=lf
+*.hcl       text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+.dockerignore text eol=lf
+.gitignore  text eol=lf
+
+# Binary / non-diffable — never normalize or diff these.
+*.wal       binary
+*.rdb       binary
+*.aof       binary
+*.png       binary
+*.jpg       binary
+*.pdf       binary
+*.gz        binary
+*.zip       binary

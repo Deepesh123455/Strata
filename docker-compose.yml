@@ -1,0 +1,115 @@
+# Local validation of the EXACT production image — contributors run the same
+# artifact CI builds and AWS runs, before they ever push.
+#
+#   docker compose up --build                  # run the cache (Ctrl-C to stop)
+#   docker compose --profile smoke up --build \
+#       --abort-on-container-exit --exit-code-from smoke   # run the smoke test
+#   docker compose down                        # stop (KEEP the WAL volume)
+#   docker compose down -v                     # stop AND wipe the WAL volume
+#
+# The runtime hardening here mirrors what the orchestrator enforces in prod
+# (read-only rootfs, dropped caps, no privilege escalation, memory cap) so a
+# misconfiguration fails locally instead of in the cloud.
+name: powerhouse-cache
+
+services:
+  powerhoused:
+    build:
+      context: .                       # repo root — the Dockerfile needs go.work
+      dockerfile: DataPlane/Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        GIT_SHA: ${GIT_SHA:-local}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    image: powerhouse-cache:local
+    # Memory cap mirrors the 1 GB-box production setting; the engine enforces it
+    # internally via the maxmemory budget + LRU eviction.
+    command: ["-maxmemory", "700"]
+    environment:
+      # Belt-and-suspenders: flag wins, but the env var documents intent and is
+      # how ECS/EC2 user-data sets it. (resolveMaxMemory honours both.)
+      POWERHOUSE_MAXMEMORY_MB: "700"
+    ports:
+      # Publish to localhost ONLY. NEVER bind 0.0.0.0 in any reachable env: the
+      # data plane has no AUTH/TLS (ARCHITECTURE §6.6).
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - wal-data:/data                 # durable WAL; survives `up`/`down`
+    stop_grace_period: 30s             # SIGTERM → drain → flush+fsync → close WAL
+    restart: unless-stopped
+
+    # ── Runtime hardening (defense in depth) ─────────────────────────────────
+    read_only: true                    # rootfs immutable; only /data is writable
+    tmpfs:
+      - /tmp                           # scratch space without a writable rootfs
+    security_opt:
+      - no-new-privileges:true         # block setuid privilege escalation
+    cap_drop:
+      - ALL                            # the server needs no Linux capabilities
+    ulimits:
+      nofile:                          # plenty of fds for many concurrent conns
+        soft: 65536
+        hard: 65536
+
+    # ── Resource ceiling (matches the Free-Tier box) ─────────────────────────
+    # Compose v2 honours deploy.resources.limits for `docker compose up`.
+    deploy:
+      resources:
+        limits:
+          memory: 1g                   # OS-level hard cap; engine cap sits below
+        reservations:
+          memory: 256m
+
+    # ── Liveness ─────────────────────────────────────────────────────────────
+    # Uses the in-image probe (the image has no shell). `smoke` waits on this.
+    healthcheck:
+      test: ["CMD", "/healthcheck", "-addr", "127.0.0.1:6379"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    networks:
+      - cache-net
+
+  # One-shot smoke test: proves the freshly-built image answers real RESP over
+  # the wire. Enabled only via `--profile smoke`, so a plain `up` won't run it.
+  # Uses the official redis image purely for its redis-cli client.
+  smoke:
+    image: redis:7-alpine
+    profiles: ["smoke"]
+    depends_on:
+      powerhoused:
+        condition: service_healthy     # don't probe until the cache is healthy
+    entrypoint: ["sh", "-c"]
+    # $$ escapes to a single $ for the container's shell (Compose interpolation).
+    command:
+      - |
+        set -eu
+        H="redis-cli -h powerhoused -p 6379"
+        echo "[smoke] SET with TTL"
+        $$H SET smoke:key hello EX 60
+        echo "[smoke] GET returns the value"
+        test "$$($$H GET smoke:key)" = "hello"
+        echo "[smoke] TTL is positive"
+        test "$$($$H TTL smoke:key)" -gt 0
+        echo "[smoke] DEL removes it"
+        $$H DEL smoke:key
+        test -z "$$($$H GET smoke:key)"
+        echo "[smoke] PASSED ✔"
+    networks:
+      - cache-net
+
+volumes:
+  wal-data:
+    driver: local
+
+networks:
+  cache-net:
+    driver: bridge

@@ -1,0 +1,43 @@
+# Dependabot — keeps every supply-chain input patched and (for Actions) pinned.
+# Three ecosystems are active today; terraform turns on once infra/ exists.
+version: 2
+updates:
+  # Go modules (the DataPlane module). Catches stdlib-adjacent and future deps.
+  - package-ecosystem: gomod
+    directory: /DataPlane
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(go)"
+    labels: ["dependencies", "go"]
+
+  # The Docker base images in DataPlane/Dockerfile (golang + distroless).
+  # When you pin base images to digests, Dependabot bumps the digests for you.
+  - package-ecosystem: docker
+    directory: /DataPlane
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps(docker)"
+    labels: ["dependencies", "docker"]
+
+  # GitHub Actions used by the workflows. Dependabot understands SHA pins and
+  # will keep them current — see CICD-SYNC.md on ratcheting tags → SHAs.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps(actions)"
+    labels: ["dependencies", "github-actions"]
+
+  # ── Enable once infra/terraform/ exists (Dependabot errors on a missing dir,
+  #    so it stays commented until then): ───────────────────────────────────
+  # - package-ecosystem: terraform
+  #   directory: /infra/terraform
+  #   schedule:
+  #     interval: weekly
+  #   commit-message:
+  #     prefix: "deps(tf)"
+  #   labels: ["dependencies", "terraform"]

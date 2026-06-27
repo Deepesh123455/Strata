@@ -1,0 +1,60 @@
+# Build context = repository root (the Dockerfile needs go.work + DataPlane/).
+# Keep the context tiny: smaller upload, faster builds, and — critically — no
+# secrets or runtime data can ever leak into an image layer.
+
+# ── VCS / CI / docs (never needed to compile the binaries) ───────────────────
+.git
+.gitattributes
+.github
+.gitignore
+docs
+*.md
+
+# ── Infrastructure & tooling (not part of the app image) ─────────────────────
+infra
+scripts
+Makefile
+docker-compose*.yml
+.dockerignore
+**/Dockerfile
+
+# ── Editor / OS noise ────────────────────────────────────────────────────────
+.vscode
+.idea
+*.iml
+**/*.swp
+**/*.swo
+.DS_Store
+Thumbs.db
+
+# ── Go build / test artifacts & local caches ─────────────────────────────────
+bin
+dist
+build
+out
+vendor
+**/*.test
+**/*.out
+**/*.exe
+**/*.exe~
+**/*.prof
+**/*.pprof
+coverage.*
+go.work.sum
+# Test sources are not needed to build the two binaries; exclude to shrink ctx.
+**/*_test.go
+
+# ── Runtime data — the WAL must NEVER be baked into an image ──────────────────
+data
+**/*.wal
+**/*.rdb
+**/*.aof
+
+# ── Secrets — defense in depth; these must never enter a layer ────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets

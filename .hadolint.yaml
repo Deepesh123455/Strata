@@ -1,0 +1,9 @@
+# hadolint config for the Dockerfile lint in CI.
+# Fail the build on real problems (warnings + errors), not stylistic info.
+failure-threshold: warning
+ignored:
+  # DL3029: "Do not use --platform with FROM." We intentionally use
+  # --platform=$BUILDPLATFORM to cross-compile on the native builder (fast),
+  # then GOOS/GOARCH-target the binary. This is the recommended multi-arch
+  # pattern, not the anti-pattern the rule warns about.
+  - DL3029

@@ -1,0 +1,41 @@
+# CodeQL — GitHub's semantic static analysis for security bugs (taint flows,
+# injection, unsafe patterns) that complements govulncheck (which finds known
+# CVEs in deps). Results land in the repo Security tab.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"   # weekly, in case a new query finds an old bug
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (Go)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload findings
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: DataPlane/go.mod
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          queries: security-extended
+      # Manual build so CodeQL traces the real compile of the module under the
+      # go.work workspace (autobuild can stumble on multi-module layouts).
+      - name: Build
+        run: cd DataPlane && go build ./...
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go"

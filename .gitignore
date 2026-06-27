@@ -117,6 +117,6 @@ appendonly.aof
 # Runtime data directory (WAL lives here at runtime; never commit it)
 /data/
 
-# ─── Generated docs ───────────────────────────────────────────────────────────
-# Keep the Markdown sources in git; the rendered PDFs are build artifacts.
-docs/*.pdf
+# ─── Docs ─────────────────────────────────────────────────────────────────────
+# Entire docs folder excluded — kept locally only, not pushed to the repo.
+docs/

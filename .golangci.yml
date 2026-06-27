@@ -1,0 +1,37 @@
+# golangci-lint config. Curated for high signal: correctness + security linters
+# that rarely false-positive, so the gate stays meaningful rather than noisy.
+# Raise the bar over time as the codebase grows.
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # Start from the defaults and ADD the ones that earn their keep here.
+  enable:
+    - govet         # suspicious constructs (incl. copylocks — mutex copies)
+    - staticcheck   # the big one: bugs, simplifications, deprecations
+    - errcheck      # unchecked errors
+    - ineffassign   # ineffective assignments
+    - unused        # dead code
+    - misspell      # typos in comments/strings
+    - unconvert     # redundant type conversions
+    - bodyclose     # unclosed HTTP/response bodies (future-proofing)
+    - copyloopvar   # loop-variable capture bugs
+
+    # gosec is intentionally OFF by default: its newer G115 (integer-overflow
+    # conversion) rule false-positives heavily on this parser/WAL arithmetic,
+    # which would make the gate noisy on day one. Source-level security is
+    # already covered by CodeQL (security-extended) + govulncheck + Trivy.
+    # Turn it on after one triage pass:
+    #   - gosec
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Tests legitimately do things linters dislike (ignored errors in setup,
+    # hardcoded test fixtures). Don't fail the build on those.
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck

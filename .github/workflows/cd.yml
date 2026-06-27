@@ -1,0 +1,183 @@
+# CD — Continuous Delivery to AWS. Runs on merge to main and on version tags.
+#
+# DESIGN: this workflow is "self-activating". On day one nothing is wired, so
+# every job is gated off and the workflow is a no-op (green/skipped). As you
+# bring the cloud online you flip it on incrementally by setting repository
+# VARIABLES (Settings → Variables → Actions) — NOT secrets, because none of
+# these are secret:
+#
+#   • AWS_REGION            e.g. us-east-1          (build-and-push + deploy)
+#   • ECR_REPOSITORY        e.g. powerhouse-cache   (build-and-push)
+#   • AWS_ROLE_ARN          ARN of gha-ci-role      → ENABLES build-and-push
+#   • AWS_DEPLOY_ROLE_ARN   ARN of gha-deploy-role  → ENABLES deploy (terraform)
+#
+# So: set AWS_ROLE_ARN (+region+repo) once ECR/OIDC exist → images start
+# shipping to ECR. Later, once infra/terraform/ exists, set AWS_DEPLOY_ROLE_ARN
+# → deploys turn on. No edits to this file are needed for either step.
+#
+# OIDC means GitHub holds ZERO long-lived AWS keys: each job mints a short-lived
+# STS token scoped by the role's trust policy (sub = this repo/ref). See §6 of
+# DEPLOYMENT.md.
+name: CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write   # REQUIRED for OIDC federation with AWS STS
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a half-finished deploy
+
+jobs:
+  build-and-push:
+    name: Build, scan, sign, push (ECR)
+    runs-on: ubuntu-latest
+    # Activates only once the CI role is wired. Until then: skipped (green).
+    if: ${{ vars.AWS_ROLE_ARN != '' }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_ref: ${{ steps.ref.outputs.image_ref }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # fetch tags so `git describe` can produce a real version
+
+      - name: Compute tags & metadata
+        id: meta
+        run: |
+          sha12="${GITHUB_SHA::12}"
+          # image_tag = short SHA → immutable, unique per commit. This is the ECR
+          # tag we deploy and roll back by (never reused, never ambiguous).
+          echo "image_tag=${sha12}" >> "$GITHUB_OUTPUT"
+          # version = the nearest git tag (e.g. v1.2.3) on a release, else the
+          # short SHA. This is the HUMAN-facing version stamped into the binary
+          # boot banner + the OCI image label.
+          echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo "${sha12}")" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC, no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-ci-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve full image ref
+        id: ref
+        run: |
+          echo "image_ref=${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3   # arm64 emulation for multi-arch
+      - uses: docker/setup-buildx-action@v3
+
+      # Build BOTH arches (amd64 + arm64) and push by digest, with SLSA
+      # provenance + an SBOM attestation attached in the registry.
+      - name: Build & push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: DataPlane/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Independent scan gate on the pushed image (ECR scan-on-push also runs).
+      - name: Scan pushed image (Trivy, fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # Keyless signing via the SAME GitHub OIDC identity (Sigstore/Fulcio).
+      # Verifiable later with: cosign verify --certificate-identity-regexp ...
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign image (keyless)
+        run: |
+          cosign sign --yes \
+            "${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+
+      - name: Generate SBOM (syft, SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.meta.outputs.image_tag }}
+          path: sbom.spdx.json
+
+  deploy:
+    name: Deploy (Terraform)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Activates only once the deploy role is wired (which you set AFTER
+    # infra/terraform/ exists). Until then: skipped (green).
+    if: ${{ vars.AWS_DEPLOY_ROLE_ARN != '' }}
+    # Protected GitHub environment → required reviewers / manual approval.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — terraform must exist
+        run: |
+          test -d infra/terraform || {
+            echo "::error::AWS_DEPLOY_ROLE_ARN is set but infra/terraform/ is missing."
+            exit 1
+          }
+
+      - name: Configure AWS credentials (OIDC deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform apply (image_tag = this commit)
+        working-directory: infra/terraform
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve \
+            -var "image_tag=${{ needs.build-and-push.outputs.image_tag }}"
+
+      # The cache is private (no public IP); a GitHub-hosted runner can't reach
+      # it. Drive the round-trip from inside the VPC instead — e.g. SSM
+      # run-command on the EC2 host, or an ECS run-task — and fail (rollback) on
+      # a bad reply. Wire this once Topology A/B exists.
+      - name: Post-deploy smoke test (in-VPC)
+        run: |
+          echo "TODO: in-VPC SET/GET/TTL round-trip via SSM run-command or ECS run-task."
+          echo "Roll back with: terraform apply -var image_tag=<previous-sha>"

@@ -27,6 +27,19 @@ const walPath = "./data/powerhouse.wal"
 // to keep the process from being OOM-killed.
 const maxMemoryEnv = "POWERHOUSE_MAXMEMORY_MB"
 
+// Build metadata, injected at link time by the Docker build / CI via
+//
+//	-ldflags "-X main.version=... -X main.gitSHA=... -X main.buildDate=..."
+//
+// They default to placeholders for `go run` / local builds. Stamping the binary
+// makes every running container traceable back to an exact git commit, which is
+// the auditability/rollback story in DEPLOYMENT.md.
+var (
+	version   = "dev"
+	gitSHA    = "unknown"
+	buildDate = "unknown"
+)
+
 // resolveMaxMemory reads the memory cap in bytes, preferring the CLI flag
 // (in MB) over the environment variable. A non-positive flag value falls back
 // to POWERHOUSE_MAXMEMORY_MB; if that is unset/invalid, the cache is unlimited.
@@ -56,6 +69,7 @@ func main() {
 
 	fmt.Println("========================================")
 	fmt.Println("    POWERHOUSE CACHE - BOOT SEQUENCE    ")
+	fmt.Printf("    version %s (%s)  built %s\n", version, gitSHA, buildDate)
 	fmt.Println("========================================")
 
 	// 1. Boot up the 32-Shard Memory Engine
