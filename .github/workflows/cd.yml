@@ -164,7 +164,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: gha-deploy-${{ github.run_id }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
 
       - name: Terraform apply (image_tag = this commit)
         working-directory: infra/terraform
