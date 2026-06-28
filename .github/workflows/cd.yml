@@ -137,7 +137,7 @@ jobs:
 
       # Independent scan gate on the pushed image (ECR scan-on-push also runs).
       - name: Scan pushed image (Trivy, fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL,HIGH

@@ -36,7 +36,9 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          # Pinned to the last golangci-lint v1: `latest` now resolves to v2,
+          # which action v6 + the v1-format .golangci.yml can't run.
+          version: v1.64.8
           working-directory: ${{ env.MODULE_DIR }}
           args: --timeout=5m
 
@@ -56,7 +58,9 @@ jobs:
       # -shuffle=on surfaces order-dependent test bugs.
       - name: go test -race
         working-directory: ${{ env.MODULE_DIR }}
-        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+        # -coverpkg=./... is REQUIRED: all tests live in `package tests`, so
+        # without it coverage is attributed only to that package (→ 0.0%).
+        run: go test -race -shuffle=on -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
       - name: Enforce coverage threshold
         working-directory: ${{ env.MODULE_DIR }}
         # Floor only — ratchet it up over time via the COVERAGE_THRESHOLD repo
@@ -158,7 +162,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan image (Trivy, fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: powerhouse-cache:ci
           format: sarif
