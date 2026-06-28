@@ -10,6 +10,7 @@ import (
 
 	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/applier"
 	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/engine"
+	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/logger"
 	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/server"
 	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/wal"
 )
@@ -54,7 +55,7 @@ func resolveMaxMemory(flagMB int64) int64 {
 	}
 	mb, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || mb <= 0 {
-		fmt.Printf("[WARN] ignoring invalid %s=%q\n", maxMemoryEnv, v)
+		logger.Warn("ignoring invalid maxmemory env var", "env", maxMemoryEnv, "value", v)
 		return 0
 	}
 	return mb * 1024 * 1024
@@ -67,17 +68,27 @@ func main() {
 	maxMemMB := flag.Int64("maxmemory", 0, "global memory cap in MB (0 = unlimited)")
 	flag.Parse()
 
-	fmt.Println("========================================")
-	fmt.Println("    POWERHOUSE CACHE - BOOT SEQUENCE    ")
-	fmt.Printf("    version %s (%s)  built %s\n", version, gitSHA, buildDate)
-	fmt.Println("========================================")
+	// Bring the structured logger online before anything else logs. Level/format
+	// come from LOG_LEVEL / LOG_FORMAT (default info/text); prod sets LOG_FORMAT=json.
+	logger.InitFromEnv()
+
+	// The ASCII banner is decorative dev sugar — keep it only in text mode so JSON
+	// log streams stay clean and machine-parseable.
+	if logger.TextMode() {
+		fmt.Println("========================================")
+		fmt.Println("    POWERHOUSE CACHE - BOOT SEQUENCE    ")
+		fmt.Println("========================================")
+	}
+	logger.Info("starting powerhouse cache",
+		"version", version, "git_sha", gitSHA, "build_date", buildDate, "pid", os.Getpid())
 
 	// 1. Boot up the 32-Shard Memory Engine
 	maxMem := resolveMaxMemory(*maxMemMB)
 	if maxMem > 0 {
-		fmt.Printf("[SYSTEM] Allocating 32-shard memory map (maxmemory: %d MB, LRU eviction)...\n", maxMem/(1024*1024))
+		logger.Info("allocating memory engine",
+			"shards", 32, "maxmemory_mb", maxMem/(1024*1024), "eviction", "lru")
 	} else {
-		fmt.Println("[SYSTEM] Allocating 32-shard memory map (maxmemory: unlimited)...")
+		logger.Info("allocating memory engine", "shards", 32, "maxmemory", "unlimited")
 	}
 	cacheEngine := engine.NewPowerhouseCache(maxMem)
 
@@ -85,33 +96,30 @@ func main() {
 	// This rebuilds everything that was durable at the last shutdown/crash and
 	// truncates any torn tail left by an unclean exit. Returns the last
 	// sequence number so the live log continues the monotonic sequence.
-	fmt.Println("[SYSTEM] Replaying write-ahead log...")
+	logger.Info("replaying write-ahead log", "path", walPath)
 	lastSeq, err := applier.LoadFromWAL(walPath, cacheEngine)
 	if err != nil {
-		fmt.Printf("[FATAL] WAL recovery failed: %v\n", err)
-		os.Exit(1)
+		logger.Fatal("wal recovery failed", "path", walPath, "err", err)
 	}
-	fmt.Printf("[SYSTEM] Recovery complete. Last sequence: %d\n", lastSeq)
+	logger.Info("recovery complete", "last_seq", lastSeq)
 
 	// 3. Open the live WAL for appends (everysec fsync) and build the applier.
 	walLog, err := wal.Open(walPath, lastSeq, wal.SyncEverySec)
 	if err != nil {
-		fmt.Printf("[FATAL] Failed to open WAL: %v\n", err)
-		os.Exit(1)
+		logger.Fatal("failed to open wal", "path", walPath, "err", err)
 	}
 	app := applier.New(cacheEngine, walLog)
-	fmt.Println("[SYSTEM] Write-ahead log online (fsync: everysec).")
+	logger.Info("write-ahead log online", "fsync", "everysec")
 
 	// 4. Initialize the TCP Edge
-	fmt.Println("[SYSTEM] Initializing TCP Edge server...")
+	logger.Info("initializing tcp edge", "addr", Port)
 	tcpServer := server.NewServer(Port, app)
 
 	// 5. Start the server in the background
 	// We run this in a Goroutine so it doesn't block our main thread!
 	go func() {
 		if err := tcpServer.Start(); err != nil {
-			fmt.Printf("[FATAL] Server crashed: %v\n", err)
-			os.Exit(1)
+			logger.Fatal("server crashed", "err", err)
 		}
 	}()
 
@@ -124,14 +132,16 @@ func main() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
 	// 7. The Main Thread goes to sleep here, waiting for a shutdown signal.
-	<-quit
+	sig := <-quit
+	logger.Info("shutdown signal received", "signal", sig.String())
 
 	// 8. We caught a signal! Drain connections, then flush + fsync + close the
 	// WAL so no acknowledged write is lost on a clean shutdown.
 	tcpServer.Stop()
 	if err := walLog.Close(); err != nil {
-		fmt.Printf("[ERROR] WAL close failed: %v\n", err)
+		logger.Error("wal close failed", "err", err)
 	} else {
-		fmt.Println("[SYSTEM] Write-ahead log flushed and closed.")
+		logger.Info("write-ahead log flushed and closed")
 	}
+	logger.Info("powerhouse cache stopped")
 }

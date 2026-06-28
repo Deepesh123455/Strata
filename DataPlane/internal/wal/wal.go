@@ -31,6 +31,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/logger"
 )
 
 const (
@@ -151,7 +153,9 @@ func (l *Log) syncLoop() {
 		case <-l.quit:
 			return
 		case <-ticker.C:
-			_ = l.flushAndSync()
+			if err := l.flushAndSync(); err != nil {
+				logger.Warn("wal fsync failed", "err", err)
+			}
 		}
 	}
 }

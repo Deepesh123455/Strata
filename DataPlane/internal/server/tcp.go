@@ -2,10 +2,12 @@ package server
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 
 	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/applier"
+	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/logger"
 )
 
 // Server is the bare-metal TCP listener.
@@ -13,25 +15,29 @@ type Server struct {
 	listenAddr string
 	listener   net.Listener
 
+	// log is the component logger; per-connection workers derive children from it.
+	log *slog.Logger
+
 	// The applier: durability boundary + 32-shard memory engine.
-	app        *applier.Applier
+	app *applier.Applier
 
 	// wg (WaitGroup) tracks exactly how many clients are currently connected.
 	// We use this to ensure we don't shut down the server while a client is talking.
-	wg         sync.WaitGroup
-	
+	wg sync.WaitGroup
+
 	// A channel to signal that the server is shutting down
-	quit       chan struct{}
+	quit chan struct{}
 
 	// conns tracks all active client connections so we can close them during Stop()
-	connsMu    sync.Mutex
-	conns      map[net.Conn]struct{}
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
 }
 
 // NewServer initializes the TCP wrapper.
 func NewServer(listenAddr string, app *applier.Applier) *Server {
 	return &Server{
 		listenAddr: listenAddr,
+		log:        logger.With("component", "server"),
 		app:        app,
 		quit:       make(chan struct{}),
 		conns:      make(map[net.Conn]struct{}),
@@ -56,7 +62,7 @@ func (s *Server) Start() error {
 	// It will sweep all shards every 100ms and is tied to s.quit so it
 	// exits automatically when Stop() is called.
 	s.app.StartExpiryWorker(s.quit)
-	fmt.Println("[SYSTEM] TTL expiry worker started.")
+	s.log.Info("ttl expiry worker started")
 
 	// 2. Tell the OS to open a TCP socket on our port
 	ln, err := net.Listen("tcp", s.listenAddr)
@@ -64,8 +70,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to bind to port: %w", err)
 	}
 	s.listener = ln
-	fmt.Printf("[SYSTEM] Powerhouse Cache listening on %s\n", s.listenAddr)
-
+	s.log.Info("listening for connections", "addr", s.listenAddr)
 
 	// 2. The Accept Loop: This runs forever until the server is shut down.
 	for {
@@ -77,7 +82,7 @@ func (s *Server) Start() error {
 			case <-s.quit:
 				return nil
 			default:
-				fmt.Printf("[ERROR] Failed to accept connection: %v\n", err)
+				s.log.Error("accept failed", "err", err)
 				continue
 			}
 		}
@@ -106,11 +111,11 @@ func (s *Server) ServeConn(conn net.Conn) {
 
 // Stop initiates a graceful shutdown of the edge.
 func (s *Server) Stop() {
-	fmt.Println("\n[SYSTEM] Initiating graceful shutdown...")
-	
+	s.log.Info("graceful shutdown initiated")
+
 	// 1. Signal all internal loops that we are quitting
 	close(s.quit)
-	
+
 	// 2. Close the hardware listener. We stop accepting NEW connections.
 	if s.listener != nil {
 		s.listener.Close()
@@ -125,8 +130,8 @@ func (s *Server) Stop() {
 
 	// 3. Wait for all CURRENTLY active clients to finish their commands.
 	// This prevents data corruption during deployments.
-	fmt.Println("[SYSTEM] Waiting for active connections to drain...")
+	s.log.Info("draining active connections")
 	s.wg.Wait()
-	
-	fmt.Println("[SYSTEM] Powerhouse Cache safely terminated.")
+
+	s.log.Info("server terminated")
 }

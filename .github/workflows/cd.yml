@@ -1,4 +1,5 @@
-# CD — Continuous Delivery to AWS. Runs on merge to main and on version tags.
+# CD — Continuous Delivery to AWS. Runs AFTER CI passes on main (via
+# workflow_run), and directly on version tags. See the ORDERING note below.
 #
 # DESIGN: this workflow is "self-activating". On day one nothing is wired, so
 # every job is gated off and the workflow is a no-op (green/skipped). As you
@@ -18,27 +19,55 @@
 # OIDC means GitHub holds ZERO long-lived AWS keys: each job mints a short-lived
 # STS token scoped by the role's trust policy (sub = this repo/ref). See §6 of
 # DEPLOYMENT.md.
+#
+# ORDERING: CD is **gated on CI**. It does NOT trigger on the push itself —
+# instead it fires via `workflow_run` when the "CI" workflow COMPLETES on main,
+# and every job is guarded by `conclusion == 'success'`. So a red CI means CD
+# never builds, scans, signs, pushes, or deploys. Two separate files, strictly
+# sequential: push → CI → (green) → CD.  (Before this, both triggered on the same
+# push and raced in parallel — CI was not actually a gate.)
+#
+# Tag releases (v*) still trigger CD directly: CI doesn't run on tags, and by
+# convention a release tag is cut from a main commit that already passed CI.
 name: CD
 
 on:
+  workflow_run:
+    workflows: ["CI"]      # must match `name:` in ci.yml exactly
+    types: [completed]
+    branches: [main]       # only CI runs whose head branch is main
   push:
-    branches: [main]
-    tags: ["v*"]
+    tags: ["v*"]           # release tags deploy directly (see note above)
 
 permissions:
   contents: read
   id-token: write   # REQUIRED for OIDC federation with AWS STS
 
+# The commit CD must act on. On a `workflow_run` event, GITHUB_SHA/github.ref
+# point at the DEFAULT-BRANCH TIP at dispatch time (which may have moved past the
+# commit CI actually validated), so we pin to the triggering run's head SHA. On a
+# tag push there's no workflow_run, so github.sha is already the tag's commit.
+env:
+  TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
 concurrency:
-  group: cd-${{ github.ref }}
-  cancel-in-progress: false   # never cancel a half-finished deploy
+  # Serialize per target commit; never cancel a half-finished deploy.
+  group: cd-${{ github.event.workflow_run.head_sha || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-and-push:
     name: Build, scan, sign, push (ECR)
     runs-on: ubuntu-latest
-    # Activates only once the CI role is wired. Until then: skipped (green).
-    if: ${{ vars.AWS_ROLE_ARN != '' }}
+    # Two gates, BOTH must hold:
+    #   1. CI must have passed — skip if a workflow_run dispatched us with any
+    #      non-success conclusion (failure/cancelled/timed_out). Tag pushes have
+    #      no workflow_run, so the OR-clause lets them through.
+    #   2. The CI role must be wired (self-activation). Until then: skipped/green.
+    if: >-
+      ${{ vars.AWS_ROLE_ARN != ''
+          && (github.event_name != 'workflow_run'
+              || github.event.workflow_run.conclusion == 'success') }}
     permissions:
       contents: read
       id-token: write
@@ -49,12 +78,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # fetch tags so `git describe` can produce a real version
+          ref: ${{ env.TARGET_SHA }}   # the exact commit CI validated, not the moving tip
+          fetch-depth: 0               # fetch tags so `git describe` can produce a real version
 
       - name: Compute tags & metadata
         id: meta
         run: |
-          sha12="${GITHUB_SHA::12}"
+          sha12="${TARGET_SHA::12}"
           # image_tag = short SHA → immutable, unique per commit. This is the ECR
           # tag we deploy and roll back by (never reused, never ambiguous).
           echo "image_tag=${sha12}" >> "$GITHUB_OUTPUT"
@@ -100,7 +130,7 @@ jobs:
             ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
-            GIT_SHA=${{ github.sha }}
+            GIT_SHA=${{ env.TARGET_SHA }}
             BUILD_DATE=${{ steps.meta.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -149,6 +179,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}   # deploy the infra at the exact validated commit
 
       - name: Guard — terraform must exist
         run: |

@@ -1,6 +1,10 @@
 package engine
 
-import "time"
+import (
+	"time"
+
+	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/logger"
+)
 
 // expiryTickInterval controls how often the background worker sweeps all shards.
 // 100ms gives sub-second expiry accuracy while keeping CPU overhead negligible.
@@ -16,6 +20,9 @@ const expiryTickInterval = 100 * time.Millisecond
 // its lifecycle tied to the server's graceful shutdown.
 func (c *PowerhouseCache) StartExpiryWorker(quit chan struct{}) {
 	go func() {
+		logger.Debug("expiry worker started", "interval_ms", expiryTickInterval.Milliseconds())
+		defer logger.Debug("expiry worker stopped")
+
 		ticker := time.NewTicker(expiryTickInterval)
 		defer ticker.Stop()
 

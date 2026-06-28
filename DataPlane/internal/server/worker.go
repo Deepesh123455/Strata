@@ -5,13 +5,37 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"time"
 
+	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/logger"
 	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/pool"
 	"github.com/Deepesh123455/Redis-Cache/DataPlane/internal/resp"
 )
+
+// cmdReject writes a RESP error reply to the client AND records it for
+// observability. reason is the human text after "-ERR " (e.g. "syntax error");
+// the wire reply is assembled as "-ERR <reason>\r\n". It is called only on
+// rejected commands — never on the success path — so the WARN line and the
+// string assembly stay off the hot path. This is the "which commands are
+// failing, how often" signal: filter logs by msg="command rejected" + cmd.
+func cmdReject(w *bufio.Writer, clog *slog.Logger, cmd, reason string) error {
+	clog.Warn("command rejected", "cmd", cmd, "reason", reason)
+	_, err := w.Write([]byte("-ERR " + reason + "\r\n"))
+	return err
+}
+
+// cmdFail records a server-side failure (e.g. the WAL append errored) and tells
+// the client the write did not persist. Distinct from cmdReject: a rejection is
+// the client's fault (bad arguments), a failure is ours (durability/IO).
+func cmdFail(w *bufio.Writer, clog *slog.Logger, cmd string, cause error) error {
+	clog.Error("command failed", "cmd", cmd, "err", cause)
+	_, err := w.Write([]byte("-ERR persistence error\r\n"))
+	return err
+}
 
 // maxCommandSize caps how large a single pipelined command may grow before we
 // give up and drop the client. It bounds the per-connection buffer so a
@@ -63,18 +87,34 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Register the connection for connection tracking and graceful shutdown
 	s.registerConn(conn)
 
+	clientAddr := conn.RemoteAddr().String()
+
+	// Per-connection logger: every line this worker emits is tagged with the
+	// client address, so connection lifecycle and per-command events can be
+	// grouped/filtered by client in production logs.
+	clog := s.log.With("client", clientAddr)
+	connectedAt := time.Now()
+	clog.Info("connection opened")
+
+	// Decide ONCE (not per command) whether debug tracing is active, so the
+	// per-command trace below costs nothing when running at info level in prod.
+	traceCommands := logger.Enabled(slog.LevelDebug)
+
 	// 1. Safety First: The Cleanup Stack
-	defer s.wg.Done()        // Tell the main Server: "I am done, subtract 1 from active clients"
+	defer s.wg.Done()            // Tell the main Server: "I am done, subtract 1 from active clients"
 	defer s.deregisterConn(conn) // Deregister from active connection tracking
-	defer conn.Close()        // Politely ask the OS to destroy the TCP socket
+	defer conn.Close()           // Politely ask the OS to destroy the TCP socket
+	defer func() {
+		clog.Info("connection closed", "duration_ms", time.Since(connectedAt).Milliseconds())
+	}()
 
 	// Isolate this client: a panic while parsing or executing one connection's
 	// data must never take down the whole server (every other client's data
-	// included). Recover here, log it, and let the deferred cleanup drop just
-	// this connection.
+	// included). Recover here, log it WITH the stack, and let the deferred
+	// cleanup drop just this connection.
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Printf("[PANIC] recovered on connection %s: %v\n", conn.RemoteAddr(), r)
+			clog.Error("panic recovered on connection", "panic", r, "stack", string(debug.Stack()))
 		}
 	}()
 
@@ -83,7 +123,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer pool.Put(bufferPtr)
 
 	buffer := *bufferPtr
-	clientAddr := conn.RemoteAddr().String()
 
 	// Buffered writer: responses are written here and flushed once per read
 	// batch (see end of the loop), collapsing a pipeline of N commands from
@@ -104,7 +143,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		// separate allocation that simply gets GC'd.
 		if unread == len(buffer) {
 			if len(buffer) >= maxCommandSize {
-				fmt.Printf("[NETWORK] Protocol error: command exceeds %d bytes from %s\n", maxCommandSize, clientAddr)
+				clog.Warn("command exceeds size limit; dropping client", "max_bytes", maxCommandSize)
 				return
 			}
 			newSize := len(buffer) * 2
@@ -131,7 +170,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			default:
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				fmt.Printf("[NETWORK] Disconnecting silent client: %s\n", clientAddr)
+				clog.Info("idle client timed out; disconnecting")
 				return // Silent Drop
 			}
 			return // Violent Crash / Closed socket
@@ -150,14 +189,24 @@ func (s *Server) handleConnection(conn net.Conn) {
 					break
 				}
 				// Bad protocol data, drop the client
-				fmt.Printf("[NETWORK] Protocol error from %s: %v\n", clientAddr, err)
+				clog.Warn("protocol error; dropping client", "err", err)
 				return
 			}
 
-			// Execute the parsed command (buffered; not yet on the wire)
-			if err := s.executeCommand(w, cmdSlices); err != nil {
+			// Execute the parsed command (buffered; not yet on the wire). When
+			// debug tracing is on, time each command and emit its verb + latency
+			// for per-command observability; in prod (info level) this is skipped.
+			var start time.Time
+			if traceCommands {
+				start = time.Now()
+			}
+			if err := s.executeCommand(w, clog, cmdSlices); err != nil {
 				// Client disconnected or connection error
 				return
+			}
+			if traceCommands {
+				clog.Debug("command processed",
+					"cmd", string(cmdSlices[0]), "latency_us", time.Since(start).Microseconds())
 			}
 
 			cursor += consumed
@@ -186,13 +235,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 // executeCommand dispatches a parsed RESP command to the correct handler.
 // Responses are written to the buffered writer w; the caller flushes once per
 // batch, so a single command never triggers its own socket syscall.
-func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
+func (s *Server) executeCommand(w *bufio.Writer, clog *slog.Logger, cmdSlices [][]byte) error {
 	if len(cmdSlices) == 0 || cmdSlices[0] == nil {
 		return nil
 	}
 
 	// Upper-case the command verb in place and switch on it. `switch string(b)`
-	// over a []byte is a compiler-optimized comparison that does not allocate.
+	// over a []byte is a compiler-optimized comparison that does not allocate,
+	// so the success path stays allocation-free; error branches pass a literal
+	// verb to the logging helpers (also no per-command allocation).
 	upperInPlace(cmdSlices[0])
 
 	switch string(cmdSlices[0]) {
@@ -202,12 +253,10 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "SET":
 		if len(cmdSlices) < 3 {
-			_, err := w.Write([]byte("-ERR wrong number of arguments for 'set' command\r\n"))
-			return err
+			return cmdReject(w, clog, "SET", "wrong number of arguments for 'set' command")
 		}
 		if cmdSlices[1] == nil {
-			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
-			return err
+			return cmdReject(w, clog, "SET", "key cannot be null")
 		}
 
 		// Parse optional EX / PX arguments that follow the value.
@@ -224,13 +273,11 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 			switch string(cmdSlices[i]) {
 			case "EX", "PX":
 				if i+1 >= len(cmdSlices) || cmdSlices[i+1] == nil {
-					_, err := w.Write([]byte("-ERR syntax error\r\n"))
-					return err
+					return cmdReject(w, clog, "SET", "syntax error")
 				}
 				val, parseErr := strconv.ParseInt(string(cmdSlices[i+1]), 10, 64)
 				if parseErr != nil || val <= 0 {
-					_, err := w.Write([]byte("-ERR invalid expire time in 'set' command\r\n"))
-					return err
+					return cmdReject(w, clog, "SET", "invalid expire time in 'set' command")
 				}
 				if string(cmdSlices[i]) == "EX" {
 					ttl = time.Duration(val) * time.Second
@@ -239,14 +286,12 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 				}
 				i += 2
 			default:
-				_, err := w.Write([]byte("-ERR syntax error\r\n"))
-				return err
+				return cmdReject(w, clog, "SET", "syntax error")
 			}
 		}
 
 		if err := s.app.Set(cmdSlices[1], cmdSlices[2], ttl); err != nil {
-			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
-			return werr
+			return cmdFail(w, clog, "SET", err)
 		}
 		_, err := w.Write(respOK)
 		return err
@@ -258,17 +303,14 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "DEL":
 		if len(cmdSlices) < 2 {
-			_, err := w.Write([]byte("-ERR wrong number of arguments for 'del' command\r\n"))
-			return err
+			return cmdReject(w, clog, "DEL", "wrong number of arguments for 'del' command")
 		}
 		if cmdSlices[1] == nil {
-			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
-			return err
+			return cmdReject(w, clog, "DEL", "key cannot be null")
 		}
 		existed, aerr := s.app.Delete(cmdSlices[1])
 		if aerr != nil {
-			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
-			return werr
+			return cmdFail(w, clog, "DEL", aerr)
 		}
 		if existed {
 			_, err := w.Write(respOne)
@@ -282,12 +324,10 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "GET":
 		if len(cmdSlices) < 2 {
-			_, err := w.Write([]byte("-ERR wrong number of arguments for 'get' command\r\n"))
-			return err
+			return cmdReject(w, clog, "GET", "wrong number of arguments for 'get' command")
 		}
 		if cmdSlices[1] == nil {
-			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
-			return err
+			return cmdReject(w, clog, "GET", "key cannot be null")
 		}
 		val, exists := s.app.Get(cmdSlices[1])
 		if !exists {
@@ -320,22 +360,18 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "EXPIRE":
 		if len(cmdSlices) < 3 {
-			_, err := w.Write([]byte("-ERR wrong number of arguments for 'expire' command\r\n"))
-			return err
+			return cmdReject(w, clog, "EXPIRE", "wrong number of arguments for 'expire' command")
 		}
 		if cmdSlices[1] == nil || cmdSlices[2] == nil {
-			_, err := w.Write([]byte("-ERR invalid arguments\r\n"))
-			return err
+			return cmdReject(w, clog, "EXPIRE", "invalid arguments")
 		}
 		secs, parseErr := strconv.ParseInt(string(cmdSlices[2]), 10, 64)
 		if parseErr != nil || secs <= 0 {
-			_, err := w.Write([]byte("-ERR invalid expire time in 'expire' command\r\n"))
-			return err
+			return cmdReject(w, clog, "EXPIRE", "invalid expire time in 'expire' command")
 		}
 		ok, aerr := s.app.Expire(cmdSlices[1], time.Duration(secs)*time.Second)
 		if aerr != nil {
-			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
-			return werr
+			return cmdFail(w, clog, "EXPIRE", aerr)
 		}
 		if ok {
 			_, err := w.Write(respOne)
@@ -350,22 +386,18 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "PEXPIRE":
 		if len(cmdSlices) < 3 {
-			_, err := w.Write([]byte("-ERR wrong number of arguments for 'pexpire' command\r\n"))
-			return err
+			return cmdReject(w, clog, "PEXPIRE", "wrong number of arguments for 'pexpire' command")
 		}
 		if cmdSlices[1] == nil || cmdSlices[2] == nil {
-			_, err := w.Write([]byte("-ERR invalid arguments\r\n"))
-			return err
+			return cmdReject(w, clog, "PEXPIRE", "invalid arguments")
 		}
 		ms, parseErr := strconv.ParseInt(string(cmdSlices[2]), 10, 64)
 		if parseErr != nil || ms <= 0 {
-			_, err := w.Write([]byte("-ERR invalid expire time in 'pexpire' command\r\n"))
-			return err
+			return cmdReject(w, clog, "PEXPIRE", "invalid expire time in 'pexpire' command")
 		}
 		ok, aerr := s.app.Expire(cmdSlices[1], time.Duration(ms)*time.Millisecond)
 		if aerr != nil {
-			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
-			return werr
+			return cmdFail(w, clog, "PEXPIRE", aerr)
 		}
 		if ok {
 			_, err := w.Write(respOne)
@@ -381,12 +413,10 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "TTL":
 		if len(cmdSlices) < 2 {
-			_, err := w.Write([]byte("-ERR wrong number of arguments for 'ttl' command\r\n"))
-			return err
+			return cmdReject(w, clog, "TTL", "wrong number of arguments for 'ttl' command")
 		}
 		if cmdSlices[1] == nil {
-			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
-			return err
+			return cmdReject(w, clog, "TTL", "key cannot be null")
 		}
 		remaining := s.app.TTL(cmdSlices[1])
 		var secs int64
@@ -411,12 +441,10 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "PTTL":
 		if len(cmdSlices) < 2 {
-			_, err := w.Write([]byte("-ERR wrong number of arguments for 'pttl' command\r\n"))
-			return err
+			return cmdReject(w, clog, "PTTL", "wrong number of arguments for 'pttl' command")
 		}
 		if cmdSlices[1] == nil {
-			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
-			return err
+			return cmdReject(w, clog, "PTTL", "key cannot be null")
 		}
 		remaining := s.app.TTL(cmdSlices[1])
 		var ms int64
@@ -440,17 +468,14 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	case "PERSIST":
 		if len(cmdSlices) < 2 {
-			_, err := w.Write([]byte("-ERR wrong number of arguments for 'persist' command\r\n"))
-			return err
+			return cmdReject(w, clog, "PERSIST", "wrong number of arguments for 'persist' command")
 		}
 		if cmdSlices[1] == nil {
-			_, err := w.Write([]byte("-ERR key cannot be null\r\n"))
-			return err
+			return cmdReject(w, clog, "PERSIST", "key cannot be null")
 		}
 		ok, aerr := s.app.Persist(cmdSlices[1])
 		if aerr != nil {
-			_, werr := w.Write([]byte("-ERR persistence error\r\n"))
-			return werr
+			return cmdFail(w, clog, "PERSIST", aerr)
 		}
 		if ok {
 			_, err := w.Write(respOne)
@@ -464,6 +489,7 @@ func (s *Server) executeCommand(w *bufio.Writer, cmdSlices [][]byte) error {
 	// -----------------------------------------------------------------------
 	default:
 		// Off the hot path; cmdSlices[0] holds the (now upper-cased) verb.
+		clog.Warn("unknown command", "cmd", string(cmdSlices[0]))
 		_, err := fmt.Fprintf(w, "-ERR unknown command '%s'\r\n", cmdSlices[0])
 		return err
 	}

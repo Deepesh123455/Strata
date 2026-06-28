@@ -29,6 +29,11 @@ services:
       # Belt-and-suspenders: flag wins, but the env var documents intent and is
       # how ECS/EC2 user-data sets it. (resolveMaxMemory honours both.)
       POWERHOUSE_MAXMEMORY_MB: "700"
+      # Structured logging: JSON lines (one object per line) for the json-file
+      # driver / CloudWatch / Loki to ingest, at info level. Set LOG_LEVEL=debug
+      # to turn on per-command tracing (cmd + latency_us).
+      LOG_FORMAT: "json"
+      LOG_LEVEL: "info"
     ports:
       # Publish to localhost ONLY. NEVER bind 0.0.0.0 in any reachable env: the
       # data plane has no AUTH/TLS (ARCHITECTURE §6.6).
