@@ -147,7 +147,7 @@ jobs:
       # Build the REAL production image (single arch for speed) and load it so
       # we can scan and smoke-test the exact artifact.
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: DataPlane/Dockerfile

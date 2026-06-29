@@ -117,7 +117,7 @@ jobs:
       # provenance + an SBOM attestation attached in the registry.
       - name: Build & push (multi-arch)
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: DataPlane/Dockerfile
