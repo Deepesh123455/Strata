@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars (gitignored) and adjust. All have sensible defaults;
+# nothing here is strictly required for a first apply.
+
+aws_region  = "us-east-1"
+project     = "powerhouse-cache"
+environment = "prod"
+
+# Free-Tier sizing.
+instance_type  = "t3.micro"
+data_volume_gb = 8
+maxmemory_mb   = 700
+
+# GitHub OIDC (the trust policy pins to these).
+github_owner              = "Deepesh123455"
+github_repo               = "Strata"
+github_deploy_environment = "production"
+
+# Optional: get alarm emails (you must confirm the SNS subscription).
+# alarm_email = "you@example.com"
+
+# CD overrides this with the git short-SHA; leave default for a manual apply.
+# image_tag = "latest"

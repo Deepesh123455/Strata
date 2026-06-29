@@ -1,0 +1,14 @@
+# Terraform state + local artifacts must never be committed.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl.backup
+crash.log
+crash.*.log
+
+# Local variable files (may hold environment-specific or sensitive values).
+*.tfvars
+!*.tfvars.example
+
+# Plan output files.
+*.tfplan

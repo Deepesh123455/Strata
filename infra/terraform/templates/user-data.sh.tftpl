@@ -1,0 +1,61 @@
+#!/bin/bash
+# Powerhouse Cache — EC2 bootstrap (Amazon Linux 2023).
+# Installs Docker, mounts the WAL volume, logs in to ECR, and runs the container.
+set -euxo pipefail
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+dnf update -y
+dnf install -y docker
+systemctl enable --now docker
+
+# aws-cli v2 ships with AL2023; guard just in case.
+command -v aws >/dev/null 2>&1 || dnf install -y awscli
+
+# ── Mount the dedicated EBS data volume at /data ──────────────────────────────
+# On Nitro instances the volume shows up under a stable by-id symlink keyed on
+# the volume's serial (the volume id without dashes), regardless of nvme naming.
+DEVICE="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${volume_serial}"
+
+# Wait for the attachment to appear.
+for _ in $(seq 1 30); do
+  [ -e "$DEVICE" ] && break
+  sleep 5
+done
+
+# Format ONLY if there is no filesystem yet — never wipe an existing WAL.
+if ! blkid "$DEVICE" >/dev/null 2>&1; then
+  mkfs.ext4 -L powerhouse "$DEVICE"
+fi
+
+mkdir -p /data
+grep -q '/data' /etc/fstab || echo "LABEL=powerhouse /data ext4 defaults,nofail 0 2" >>/etc/fstab
+mount -a
+# The container runs as uid/gid 65532 (distroless nonroot) and must own /data.
+chown 65532:65532 /data
+
+# ── Run the container ─────────────────────────────────────────────────────────
+aws ecr get-login-password --region ${region} \
+  | docker login --username AWS --password-stdin ${ecr_registry}
+
+docker pull ${image}
+docker rm -f powerhoused 2>/dev/null || true
+
+docker run -d \
+  --name powerhoused \
+  --restart always \
+  --read-only \
+  --tmpfs /tmp \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --memory ${docker_memory} \
+  --stop-timeout 30 \
+  -p 6379:6379 \
+  -v /data:/data \
+  -e POWERHOUSE_MAXMEMORY_MB=${maxmemory_mb} \
+  -e LOG_FORMAT=json \
+  -e LOG_LEVEL=info \
+  --log-driver=awslogs \
+  --log-opt awslogs-region=${region} \
+  --log-opt awslogs-group=${log_group} \
+  --log-opt awslogs-create-group=false \
+  ${image} -maxmemory ${maxmemory_mb}
