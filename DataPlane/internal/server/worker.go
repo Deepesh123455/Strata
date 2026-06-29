@@ -134,7 +134,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// 3. The Continuous Read Loop
 	for {
 		// 4. The Hardware Watchdog (Protection against DoS / Dead clients)
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		// A failed deadline-set means the watchdog is inactive for this socket —
+		// don't serve a connection we can no longer time out; drop it.
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+			clog.Warn("failed to set read deadline; dropping client", "err", err)
+			return
+		}
 
 		// The buffer is full of unparsed bytes — a single command is larger than
 		// the current buffer. Grow it (doubling) so large values are accepted,

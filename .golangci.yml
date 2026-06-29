@@ -30,6 +30,13 @@ linters:
     #   - gosec
 
   exclusions:
+    presets:
+      # Restores golangci-lint v1's built-in EXC0001 default (made opt-in in v2):
+      # don't flag unchecked errors on conventional cleanup/throwaway calls such
+      # as `.*Close`, `Flush`, `os.Remove*`, and the print family. These are
+      # deliberate fire-and-forget cleanups (deferred conn/file Close, etc.);
+      # errors that genuinely matter are handled explicitly at the call site.
+      - std-error-handling
     rules:
       # Tests legitimately do things linters dislike (ignored errors in setup,
       # hardcoded test fixtures). Don't fail the build on those.
