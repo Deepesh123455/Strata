@@ -7,3 +7,10 @@ ignored:
   # then GOOS/GOARCH-target the binary. This is the recommended multi-arch
   # pattern, not the anti-pattern the rule warns about.
   - DL3029
+  # DL3003: "Use WORKDIR to switch to a directory." We `cd DataPlane &&` inside
+  # the build RUNs on purpose: the Go module lives in the DataPlane/ subdir while
+  # the COPY paths (go.work, DataPlane/) are relative to /src. Switching WORKDIR
+  # to /src/DataPlane would break the subsequent `COPY DataPlane/ DataPlane/`, and
+  # we must stay in /src so go.work workspace resolution works. The `cd` is scoped
+  # to each RUN and is the correct pattern here.
+  - DL3003
