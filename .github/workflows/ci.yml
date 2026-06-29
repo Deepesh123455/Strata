@@ -34,11 +34,12 @@ jobs:
           go-version-file: ${{ env.MODULE_DIR }}/go.mod
           cache-dependency-path: ${{ env.MODULE_DIR }}/go.mod
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          # Pinned to the last golangci-lint v1: `latest` now resolves to v2,
-          # which action v6 + the v1-format .golangci.yml can't run.
-          version: v1.64.8
+          # v9 runs on Node 24 (v6/v7/v8 were Node 20, now deprecated on GitHub
+          # runners). v9 requires golangci-lint v2, so the binary is pinned to a
+          # concrete v2.x and .golangci.yml is in the v2 format.
+          version: v2.12.2
           working-directory: ${{ env.MODULE_DIR }}
           args: --timeout=5m
 

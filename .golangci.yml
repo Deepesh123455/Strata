@@ -1,12 +1,16 @@
-# golangci-lint config. Curated for high signal: correctness + security linters
-# that rarely false-positive, so the gate stays meaningful rather than noisy.
-# Raise the bar over time as the codebase grows.
+# golangci-lint config (v2 format — required by golangci-lint v2 / action v9).
+# Curated for high signal: correctness + security linters that rarely
+# false-positive, so the gate stays meaningful rather than noisy. Raise the bar
+# over time as the codebase grows.
+version: "2"
+
 run:
-  timeout: 5m
   tests: true
 
 linters:
-  # Start from the defaults and ADD the ones that earn their keep here.
+  # Start from the default ("standard") set — errcheck, govet, ineffassign,
+  # staticcheck, unused — and ADD the ones that earn their keep here. (staticcheck
+  # in v2 also subsumes the old gosimple + stylecheck.)
   enable:
     - govet         # suspicious constructs (incl. copylocks — mutex copies)
     - staticcheck   # the big one: bugs, simplifications, deprecations
@@ -25,13 +29,15 @@ linters:
     # Turn it on after one triage pass:
     #   - gosec
 
+  exclusions:
+    rules:
+      # Tests legitimately do things linters dislike (ignored errors in setup,
+      # hardcoded test fixtures). Don't fail the build on those.
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    # Tests legitimately do things linters dislike (ignored errors in setup,
-    # hardcoded test fixtures). Don't fail the build on those.
-    - path: _test\.go
-      linters:
-        - gosec
-        - errcheck
