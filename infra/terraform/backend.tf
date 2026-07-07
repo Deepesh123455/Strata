@@ -5,7 +5,7 @@
 # `region` / `dynamodb_table` in sync). This is the ONE manual edit in the repo.
 terraform {
   backend "s3" {
-    bucket         = "powerhouse-cache-tfstate-CHANGEME"
+    bucket         = "powerhouse-cache-tfstate-210884642872"
     key            = "powerhouse-cache/terraform.tfstate"
     region         = "us-east-1"
     dynamodb_table = "powerhouse-cache-tflock"

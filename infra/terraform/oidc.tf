@@ -123,6 +123,38 @@ data "aws_iam_policy_document" "deploy" {
     #tfsec:ignore:aws-iam-no-policy-wildcards
     resources = ["*"]
   }
+  # ── App-deploy path (decoupled from infra) ──────────────────────────────────
+  # CD's deploy-app job assumes THIS role (it also runs in environment:production)
+  # to set the desired image tag and trigger an in-place container redeploy via
+  # SSM run-command — no terraform, no instance churn.
+  statement {
+    sid = "ManageImageTagParam"
+    actions = [
+      "ssm:PutParameter",
+      "ssm:AddTagsToResource",
+      "ssm:ListTagsForResource",
+      "ssm:DeleteParameter",
+    ]
+    resources = [aws_ssm_parameter.image_tag.arn]
+  }
+  statement {
+    sid     = "AppDeploySendCommand"
+    actions = ["ssm:SendCommand"]
+    resources = [
+      aws_instance.cache.arn,
+      "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
+    ]
+  }
+  statement {
+    sid = "AppDeployReadCommand"
+    actions = [
+      "ssm:GetCommandInvocation",
+      "ssm:ListCommandInvocations",
+    ]
+    # Command-invocation ids are minted at run time and can't be pre-scoped.
+    #tfsec:ignore:aws-iam-no-policy-wildcards
+    resources = ["*"]
+  }
   # IAM, scoped to this project's roles/policies/profiles only.
   statement {
     sid = "ManageProjectIam"
@@ -140,6 +172,10 @@ data "aws_iam_policy_document" "deploy" {
       "iam:DeleteRolePolicy",
       "iam:AttachRolePolicy",
       "iam:DetachRolePolicy",
+      # Lets a CD-driven apply update a role's TRUST policy (e.g. re-pin the OIDC
+      # sub). Without it, changing any assume_role_policy here is denied and must
+      # fall back to a human apply. Scoped to this project's roles below.
+      "iam:UpdateAssumeRolePolicy",
       "iam:CreateInstanceProfile",
       "iam:DeleteInstanceProfile",
       "iam:GetInstanceProfile",

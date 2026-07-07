@@ -90,6 +90,12 @@ data "aws_iam_policy_document" "instance" {
     #tfsec:ignore:aws-iam-no-policy-wildcards
     resources = ["${aws_cloudwatch_log_group.app.arn}:*"]
   }
+  # Read the desired image tag the redeploy script pulls (boot + SSM redeploys).
+  statement {
+    sid       = "ReadImageTagParam"
+    actions   = ["ssm:GetParameter"]
+    resources = [aws_ssm_parameter.image_tag.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "instance" {

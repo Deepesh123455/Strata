@@ -73,21 +73,36 @@ Actions** set:
 | `AWS_REGION` | e.g. `us-east-1` |
 | `ECR_REPOSITORY` | `powerhouse-cache` (the repo name) |
 | `AWS_ROLE_ARN` | `gha_ci_role_arn` output → enables CD build+push |
-| `AWS_DEPLOY_ROLE_ARN` | `gha_deploy_role_arn` output → enables CD deploy |
+| `AWS_DEPLOY_ROLE_ARN` | `gha_deploy_role_arn` output → enables CD deploy (app + infra) |
 
 Also create a protected GitHub Environment named **`production`** (required
-reviewers) — the deploy role's trust policy is pinned to it.
+reviewers) — the deploy role's trust policy is pinned to it, and **both** the
+`deploy-app` and `deploy-infra` jobs run in it.
 
-## Deploy model
+> Only if you override `project`/`environment` from their defaults
+> (`powerhouse-cache`/`prod`) in `*.tfvars`: also set repo variables `PROJECT`
+> and `ENVIRONMENT` to the same values, because `deploy-app` locates the instance
+> and the SSM tag parameter by the `<project>-<environment>` name.
 
-CD runs `terraform apply -var image_tag=<git-sha>`. `image_tag` is baked into
-user-data with `user_data_replace_on_change = true`, so a new tag **replaces the
-instance**; the EBS data volume detaches and reattaches to the fresh box, the WAL
-replays on boot, and the Elastic IP keeps the endpoint stable. Brief downtime per
-deploy. Rollback = re-apply a previous `image_tag` (still in ECR).
+## Deploy model (app deploys are decoupled from infra)
 
-> Production-grade upgrade (roadmap): pull in-place via SSM run-command with zero
-> instance churn, instead of replacing the box.
+The desired image tag lives in an **SSM Parameter** (`/<project>-<env>/image_tag`),
+not in user-data. Two independent paths:
+
+- **App deploy (every green push to `main`, the common case).** CD's `deploy-app`
+  job sets the SSM tag parameter to the new git-SHA and reruns the on-box
+  `powerhouse-redeploy.sh` via **SSM run-command** — it pulls the new image and
+  restarts the container. **No `terraform apply`, no instance replacement.**
+- **Infra deploy (only when `infra/terraform/**` changes, or on a `v*` tag).** CD's
+  `deploy-infra` job runs `terraform apply`. Because the tag is no longer templated
+  into user-data, an image change never alters user-data, so infra apply doesn't
+  churn the box. `image_tag` only *seeds* the SSM parameter on first create
+  (`ignore_changes = [value]`), so an apply never reverts a live deploy.
+
+On any instance replacement the fresh box reads the tag from SSM and pulls the
+last-deployed image; the EBS data volume reattaches (WAL replays) and the Elastic
+IP keeps the endpoint stable. **Rollback** = re-run CD against a previous SHA (its
+image is still in ECR), which just rewrites the SSM param and reruns the script.
 
 ## Ops
 

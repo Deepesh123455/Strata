@@ -33,13 +33,16 @@ resource "aws_ecr_lifecycle_policy" "main" {
         action = { type = "expire" }
       },
       {
+        # Retain the 20 most-recent images by push time, regardless of tag.
+        # ECR caps tagPrefixList at 10 entries, and our real tags are 12-char
+        # hex git SHAs (16 possible prefixes) plus `latest`/`v*`, which a prefix
+        # list can't faithfully cover — so use tagStatus="any" as the catch-all.
         rulePriority = 2
-        description  = "Keep only the last 20 tagged images"
+        description  = "Keep only the last 20 images"
         selection = {
-          tagStatus     = "tagged"
-          tagPrefixList = ["v", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
-          countType     = "imageCountMoreThan"
-          countNumber   = 20
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 20
         }
         action = { type = "expire" }
       },

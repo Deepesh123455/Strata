@@ -1,0 +1,484 @@
+# CI/CD — one workflow, one file. CI jobs are the gate; CD jobs run only after
+# every CI job is green (enforced by `needs:`, not a separate `workflow_run`
+# workflow). This replaces the old ci.yml + cd.yml pair.
+#
+# WHY ONE FILE: `workflow_run` is a footgun — it runs the workflow definition
+# from the DEFAULT branch and points github.ref/sha at the moving tip, forcing
+# head_sha gymnastics. A single workflow with a `needs:` graph is the idiomatic
+# "CI gates CD" pattern: on a push, github.sha already IS the validated commit.
+#
+# SELF-ACTIVATING via repository VARIABLES (Settings → Variables → Actions),
+# never secrets — OIDC means there are no AWS keys to store:
+#   • AWS_REGION          e.g. us-east-1
+#   • ECR_REPOSITORY      e.g. powerhouse-cache
+#   • AWS_ROLE_ARN        gha-ci-role     → enables build-and-push
+#   • AWS_DEPLOY_ROLE_ARN gha-deploy-role → enables deploy-app + deploy-infra
+#   • PROJECT/ENVIRONMENT (optional) override the powerhouse-cache/prod defaults
+#
+# DEPLOY MODEL (decoupled):
+#   • deploy-app   — every green push to main. Sets the desired image tag in SSM
+#                    Parameter Store and runs an IN-PLACE container redeploy on
+#                    the box via SSM run-command. NO terraform, NO instance churn.
+#   • deploy-infra — only when infra/terraform/** changed, or on a v* tag. Runs
+#                    terraform apply. App image changes no longer touch it.
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+# Least privilege by default; individual jobs widen only what they need.
+permissions:
+  contents: read
+
+concurrency:
+  # One group per ref. PRs cancel superseded runs (save minutes); pushes to main
+  # / tags NEVER cancel, so a half-finished deploy is never interrupted.
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MODULE_DIR: DataPlane
+
+jobs:
+  # ── CI ──────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.MODULE_DIR }}/go.mod
+          cache-dependency-path: ${{ env.MODULE_DIR }}/go.mod
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          working-directory: ${{ env.MODULE_DIR }}
+          args: --timeout=5m
+
+  test:
+    name: Test (race + coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.MODULE_DIR }}/go.mod
+          cache-dependency-path: ${{ env.MODULE_DIR }}/go.mod
+      - name: go vet
+        working-directory: ${{ env.MODULE_DIR }}
+        run: go vet ./...
+      # -race is essential here: 32 shards, atomics, goroutine-per-connection.
+      # -shuffle=on surfaces order-dependent test bugs.
+      - name: go test -race
+        working-directory: ${{ env.MODULE_DIR }}
+        # -coverpkg=./... is REQUIRED: all tests live in `package tests`, so
+        # without it coverage is attributed only to that package (→ 0.0%).
+        run: go test -race -shuffle=on -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
+      - name: Enforce coverage threshold
+        working-directory: ${{ env.MODULE_DIR }}
+        run: |
+          thr="${{ vars.COVERAGE_THRESHOLD || '30' }}"
+          cov="$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')"
+          echo "total coverage: ${cov}%  (floor: ${thr}%)"
+          awk -v c="$cov" -v t="$thr" 'BEGIN { exit (c+0 < t+0) ? 1 : 0 }' \
+            || { echo "::error::coverage ${cov}% is below the ${thr}% floor"; exit 1; }
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: ${{ env.MODULE_DIR }}/coverage.out
+          if-no-files-found: ignore
+
+  vuln:
+    name: Vulnerabilities (govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.MODULE_DIR }}/go.mod
+          cache-dependency-path: ${{ env.MODULE_DIR }}/go.mod
+      - name: govulncheck (deps + stdlib)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          cd "${{ env.MODULE_DIR }}" && govulncheck ./...
+
+  modules:
+    name: Module integrity (go.sum / tidy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.MODULE_DIR }}/go.mod
+          cache-dependency-path: ${{ env.MODULE_DIR }}/go.mod
+      - name: Verify module checksums against go.sum
+        working-directory: ${{ env.MODULE_DIR }}
+        run: go mod verify
+      - name: Ensure go.mod/go.sum are tidy AND committed
+        working-directory: ${{ env.MODULE_DIR }}
+        run: |
+          go mod tidy
+          changed="$(git status --porcelain -- go.mod go.sum)"
+          if [ -n "$changed" ]; then
+            echo "::error::go.mod/go.sum are not tidy or not committed."
+            echo "Run 'go mod tidy' in DataPlane/ and commit go.mod + go.sum."
+            echo "--- offending paths ---"; echo "$changed"
+            git --no-pager diff -- go.mod go.sum || true
+            exit 1
+          fi
+          echo "OK: modules tidy & in sync (go.sum currently empty — stdlib only)."
+
+  image:
+    name: Image build + scan + smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # to upload the Trivy SARIF to the Security tab
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: DataPlane/Dockerfile
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: DataPlane/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: powerhouse-cache:ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.pushed_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image (Trivy, fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: powerhouse-cache:ci
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Smoke test (docker compose)
+        run: docker compose --profile smoke up --abort-on-container-exit --exit-code-from smoke
+      - name: Teardown
+        if: always()
+        run: docker compose --profile smoke down -v
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # scan full history, not just the tip
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  iac:
+    name: Terraform scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect terraform
+        id: detect
+        run: |
+          if [ -d infra/terraform ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::infra/terraform/ not present yet — skipping IaC scan."
+          fi
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.detect.outputs.present == 'true'
+      - name: terraform fmt + validate
+        if: steps.detect.outputs.present == 'true'
+        working-directory: infra/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+      - name: tfsec
+        if: steps.detect.outputs.present == 'true'
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: infra/terraform
+
+  # ── Which paths changed? Drives whether infra apply runs (decoupling). ───────
+  detect:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.f.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: f
+        with:
+          filters: |
+            infra:
+              - 'infra/terraform/**'
+
+  # ── CD: build + push (gated on ALL of CI via needs) ─────────────────────────
+  build-and-push:
+    name: Build, scan, sign, push (ECR)
+    needs: [lint, test, vuln, modules, image, secrets, iac]
+    runs-on: ubuntu-latest
+    # Only on pushes to main / tags (never on PRs), and only once the CI role is
+    # wired. Until AWS_ROLE_ARN is set this is skipped → the whole CD chain is a
+    # no-op and the workflow stays green.
+    if: >-
+      ${{ vars.AWS_ROLE_ARN != ''
+          && github.event_name == 'push'
+          && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_ref: ${{ steps.ref.outputs.image_ref }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # fetch tags so `git describe` can produce a real version
+
+      - name: Compute tags & metadata
+        id: meta
+        run: |
+          sha12="${GITHUB_SHA::12}"
+          # image_tag = short SHA → immutable, unique per commit. This is the ECR
+          # tag we deploy and roll back by (never reused, never ambiguous).
+          echo "image_tag=${sha12}" >> "$GITHUB_OUTPUT"
+          echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo "${sha12}")" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC, no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-ci-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve full image ref
+        id: ref
+        run: |
+          echo "image_ref=${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3   # arm64 emulation for multi-arch
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: DataPlane/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan pushed image (Trivy, fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign image (keyless)
+        run: |
+          cosign sign --yes \
+            "${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+
+      - name: Generate SBOM (syft, SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.meta.outputs.image_tag }}
+          path: sbom.spdx.json
+
+  # ── CD: infra apply — ONLY when infra changed or on a tag (decoupled) ───────
+  deploy-infra:
+    name: Deploy infra (Terraform)
+    needs: [build-and-push, detect]
+    runs-on: ubuntu-latest
+    # Runs only if the deploy role is wired AND this push actually changed
+    # infra/terraform/** (or is a release tag). A plain code change skips this
+    # entirely — that is the decoupling.
+    if: >-
+      ${{ vars.AWS_DEPLOY_ROLE_ARN != ''
+          && needs.build-and-push.result == 'success'
+          && (startsWith(github.ref, 'refs/tags/v') || needs.detect.outputs.infra == 'true') }}
+    environment: production   # protected env → manual approval; also the OIDC sub the deploy role trusts
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — terraform must exist
+        run: |
+          test -d infra/terraform || {
+            echo "::error::AWS_DEPLOY_ROLE_ARN is set but infra/terraform/ is missing."
+            exit 1
+          }
+
+      - name: Configure AWS credentials (OIDC deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-infra-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform apply
+        working-directory: infra/terraform
+        # image_tag only SEEDS the SSM tag parameter on first create; the param
+        # has ignore_changes on its value, so app deploys own the live tag and an
+        # infra apply never reverts it or churns the box for an image change.
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve \
+            -var "image_tag=${{ needs.build-and-push.outputs.image_tag }}"
+
+  # ── CD: app deploy — every green push. SSM redeploy, no terraform, no churn ──
+  deploy-app:
+    name: Deploy app (SSM in-place, no churn)
+    needs: [build-and-push, deploy-infra]
+    runs-on: ubuntu-latest
+    # Runs whenever build-and-push succeeded and the deploy role is wired. Uses
+    # always() so a SKIPPED deploy-infra (the common case) doesn't block it, but
+    # a FAILED infra apply does (don't deploy onto broken infra).
+    if: >-
+      ${{ always()
+          && vars.AWS_DEPLOY_ROLE_ARN != ''
+          && needs.build-and-push.result == 'success'
+          && (needs.deploy-infra.result == 'success' || needs.deploy-infra.result == 'skipped') }}
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NAME: ${{ vars.PROJECT || 'powerhouse-cache' }}-${{ vars.ENVIRONMENT || 'prod' }}
+    steps:
+      - name: Configure AWS credentials (OIDC deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-app-${{ github.run_id }}
+
+      - name: Find the running cache instance
+        id: tgt
+        run: |
+          iid="$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${NAME}" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)"
+          test -n "$iid" && [ "$iid" != "None" ] || {
+            echo "::error::no running cache instance tagged Name=${NAME} found. Run deploy-infra first."
+            exit 1
+          }
+          echo "instance_id=$iid" >> "$GITHUB_OUTPUT"
+
+      - name: Set desired image tag (SSM Parameter Store)
+        run: |
+          aws ssm put-parameter --overwrite \
+            --name "/${NAME}/image_tag" \
+            --type String \
+            --value "${{ needs.build-and-push.outputs.image_tag }}"
+
+      - name: Redeploy container in place (SSM run-command)
+        env:
+          IID: ${{ steps.tgt.outputs.instance_id }}
+        run: |
+          cmd_id="$(aws ssm send-command \
+            --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --comment "powerhouse app deploy ${{ needs.build-and-push.outputs.image_tag }}" \
+            --parameters commands='["/usr/local/bin/powerhouse-redeploy.sh"]' \
+            --query 'Command.CommandId' --output text)"
+          echo "command id: $cmd_id"
+
+          # Poll until the invocation reaches a terminal state. The AWS waiter caps
+          # at ~100s, which a multi-arch `docker pull` on a t3.micro can exceed, so
+          # roll our own with a generous ceiling (~10 min).
+          status="Pending"
+          for _ in $(seq 1 120); do
+            status="$(aws ssm get-command-invocation \
+              --command-id "$cmd_id" --instance-id "$IID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)"
+            case "$status" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+          echo "redeploy status: $status"
+
+          # Surface the on-box output for debugging regardless of outcome.
+          aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$IID" \
+            --query 'StandardErrorContent' --output text || true
+
+          [ "$status" = "Success" ] || {
+            echo "::error::in-place redeploy failed (status=$status). Roll back by re-running against a previous SHA."
+            exit 1
+          }
+
+      # The cache is private (no public ingress on 6379). Drive the round-trip
+      # from inside the VPC. TODO: SSM run-command a redis-cli SET/GET/TTL here.
+      - name: Post-deploy smoke test (in-VPC)
+        run: |
+          echo "TODO: in-VPC SET/GET/TTL round-trip via SSM run-command."
+          echo "Roll back: re-run CD against a previous SHA (its image is still in ECR)."

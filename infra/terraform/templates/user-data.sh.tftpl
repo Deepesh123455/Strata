@@ -1,6 +1,9 @@
 #!/bin/bash
 # Powerhouse Cache — EC2 bootstrap (Amazon Linux 2023).
-# Installs Docker, mounts the WAL volume, logs in to ECR, and runs the container.
+# Installs Docker, mounts the WAL volume, installs the redeploy script, and runs
+# the container once. The image TAG is NOT baked in here — it is read from SSM
+# Parameter Store, so an app deploy (which just updates that parameter + reruns
+# the script via SSM) causes NO instance churn and NO user-data change.
 set -euxo pipefail
 
 # ── Docker ───────────────────────────────────────────────────────────────────
@@ -33,13 +36,39 @@ mount -a
 # The container runs as uid/gid 65532 (distroless nonroot) and must own /data.
 chown 65532:65532 /data
 
-# ── Run the container ─────────────────────────────────────────────────────────
-aws ecr get-login-password --region ${region} \
-  | docker login --username AWS --password-stdin ${ecr_registry}
+# ── Install the redeploy script ───────────────────────────────────────────────
+# SINGLE source of truth for (re)launching the container. Boot runs it once; CD
+# runs it via SSM run-command on every app deploy. It reads the desired image tag
+# from SSM Parameter Store, so the box always converges to the last-deployed SHA
+# — even after an infra-driven instance replacement.
+#
+# NOTE: this heredoc is quoted ('REDEPLOY') so BASH does not expand it at write
+# time, but Terraform's templatefile() STILL substitutes its dollar-brace
+# placeholders (region, registry, memory, log group, param name) — that is how the
+# infra-level values get baked in as literals. Runtime shell values use $VAR and
+# command substitution, which Terraform leaves untouched.
+cat >/usr/local/bin/powerhouse-redeploy.sh <<'REDEPLOY'
+#!/bin/bash
+set -euxo pipefail
 
-docker pull ${image}
+REGION="${region}"
+ECR_REGISTRY="${ecr_registry}"
+ECR_REPO_URL="${ecr_repo_url}"
+TAG_PARAM="${tag_param}"
+MAXMEMORY_MB="${maxmemory_mb}"
+DOCKER_MEMORY="${docker_memory}"
+LOG_GROUP="${log_group}"
+
+# Desired tag is owned by CD (out-of-band); read it fresh each redeploy.
+TAG="$(aws ssm get-parameter --region "$REGION" --name "$TAG_PARAM" --query 'Parameter.Value' --output text)"
+IMAGE="$ECR_REPO_URL:$TAG"
+
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+docker pull "$IMAGE"
+
 docker rm -f powerhoused 2>/dev/null || true
-
 docker run -d \
   --name powerhoused \
   --restart always \
@@ -47,15 +76,23 @@ docker run -d \
   --tmpfs /tmp \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
-  --memory ${docker_memory} \
+  --memory "$DOCKER_MEMORY" \
   --stop-timeout 30 \
   -p 6379:6379 \
   -v /data:/data \
-  -e POWERHOUSE_MAXMEMORY_MB=${maxmemory_mb} \
+  -e POWERHOUSE_MAXMEMORY_MB="$MAXMEMORY_MB" \
   -e LOG_FORMAT=json \
   -e LOG_LEVEL=info \
   --log-driver=awslogs \
-  --log-opt awslogs-region=${region} \
-  --log-opt awslogs-group=${log_group} \
+  --log-opt awslogs-region="$REGION" \
+  --log-opt awslogs-group="$LOG_GROUP" \
   --log-opt awslogs-create-group=false \
-  ${image} -maxmemory ${maxmemory_mb}
+  "$IMAGE" -maxmemory "$MAXMEMORY_MB"
+
+# Keep the small root disk from filling with superseded images.
+docker image prune -f >/dev/null 2>&1 || true
+REDEPLOY
+chmod 0755 /usr/local/bin/powerhouse-redeploy.sh
+
+# ── First launch ──────────────────────────────────────────────────────────────
+/usr/local/bin/powerhouse-redeploy.sh
