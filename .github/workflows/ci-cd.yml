@@ -48,7 +48,7 @@ jobs:
     name: Lint (golangci-lint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.MODULE_DIR }}/go.mod
@@ -64,7 +64,7 @@ jobs:
     name: Test (race + coverage)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.MODULE_DIR }}/go.mod
@@ -99,7 +99,7 @@ jobs:
     name: Vulnerabilities (govulncheck)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.MODULE_DIR }}/go.mod
@@ -113,7 +113,7 @@ jobs:
     name: Module integrity (go.sum / tidy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.MODULE_DIR }}/go.mod
@@ -142,7 +142,7 @@ jobs:
       contents: read
       security-events: write   # to upload the Trivy SARIF to the Security tab
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Lint the Dockerfile (hadolint)
         uses: hadolint/hadolint-action@v3.1.0
@@ -195,7 +195,7 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # scan full history, not just the tip
       - uses: gitleaks/gitleaks-action@v2
@@ -206,7 +206,7 @@ jobs:
     name: Terraform scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Detect terraform
         id: detect
         run: |
@@ -238,7 +238,7 @@ jobs:
     outputs:
       infra: ${{ steps.f.outputs.infra }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: dorny/paths-filter@v3
@@ -268,7 +268,7 @@ jobs:
       image_ref: ${{ steps.ref.outputs.image_ref }}
       digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # fetch tags so `git describe` can produce a real version
 
@@ -365,7 +365,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Guard — terraform must exist
         run: |
