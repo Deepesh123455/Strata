@@ -216,7 +216,7 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "::notice::infra/terraform/ not present yet — skipping IaC scan."
           fi
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         if: steps.detect.outputs.present == 'true'
       - name: terraform fmt + validate
         if: steps.detect.outputs.present == 'true'
@@ -381,7 +381,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: gha-deploy-infra-${{ github.run_id }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
 
       - name: Terraform apply
         working-directory: infra/terraform
