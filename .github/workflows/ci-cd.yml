@@ -295,8 +295,19 @@ jobs:
 
       - name: Resolve full image ref
         id: ref
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
         run: |
-          echo "image_ref=${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}" >> "$GITHUB_OUTPUT"
+          # Strip any stray whitespace from the repo variable — a leading/trailing
+          # space produces an "invalid reference format" build failure otherwise.
+          registry="$(echo -n "$REGISTRY" | tr -d '[:space:]')"
+          repository="$(echo -n "$REPOSITORY" | tr -d '[:space:]')"
+          if [ -z "$repository" ]; then
+            echo "::error::ECR_REPOSITORY repo variable is empty" >&2
+            exit 1
+          fi
+          echo "image_ref=${registry}/${repository}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3   # arm64 emulation for multi-arch
       - uses: docker/setup-buildx-action@v4
@@ -312,8 +323,8 @@ jobs:
           provenance: true
           sbom: true
           tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
-            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
+            ${{ steps.ref.outputs.image_ref }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.ref.outputs.image_ref }}:latest
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             GIT_SHA=${{ github.sha }}
@@ -324,7 +335,7 @@ jobs:
       - name: Scan pushed image (Trivy, fail on HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ steps.ref.outputs.image_ref }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
@@ -334,12 +345,12 @@ jobs:
       - name: Sign image (keyless)
         run: |
           cosign sign --yes \
-            "${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+            "${{ steps.ref.outputs.image_ref }}@${{ steps.build.outputs.digest }}"
 
       - name: Generate SBOM (syft, SPDX)
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          image: ${{ steps.ref.outputs.image_ref }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
       - name: Upload SBOM artifact
