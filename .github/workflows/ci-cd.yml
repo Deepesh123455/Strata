@@ -89,7 +89,7 @@ jobs:
             || { echo "::error::coverage ${cov}% is below the ${thr}% floor"; exit 1; }
       - name: Upload coverage artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: ${{ env.MODULE_DIR }}/coverage.out
@@ -354,7 +354,7 @@ jobs:
           format: spdx-json
           output-file: sbom.spdx.json
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-${{ steps.meta.outputs.image_tag }}
           path: sbom.spdx.json
